@@ -102,16 +102,25 @@ def publish_lot(session, game_data, short_description, full_description, payment
 
         for item in soup.find_all(['input', 'textarea', 'select']):
             name = item.get('name')
-            if not name or 'fields' not in name or name in payload: continue
+            if not name or name in payload: continue
+
+            # <select> — всегда обрабатываем, даже если нет "fields" в имени
+            if item.name == 'select':
+                _fill_select(payload, name, item)
+                continue
+
+            # <input type="hidden"> — всегда включаем значение
+            if item.get('type') == 'hidden':
+                payload[name] = item.get('value', '')
+                continue
+
+            # Текстовые поля — только с "fields" в имени
+            if 'fields' not in name: continue
             low = name.lower()
             if 'summary' in low: payload[name] = s_en if '[en]' in low else short_description[:100]
             elif 'desc' in low: payload[name] = f_en if '[en]' in low else full_description
             elif 'payment_msg' in low: payload[name] = p_en if '[en]' in low else payment_message
             elif 'quantity' in low or 'amount' in low: payload[name] = "999"
-            if item.name == 'select':
-                _fill_select(payload, name, item)
-            if item.get('type') == 'hidden' and name not in payload:
-                payload[name] = item.get('value', '')
 
         response = session.post(save_url, data=payload, headers={"X-Requested-With": "XMLHttpRequest", "Referer": edit_url}, timeout=30)
         result = response.json()
