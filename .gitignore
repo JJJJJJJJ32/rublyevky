@@ -1,0 +1,17 @@
+# Секретные ключи и токены
+.env
+token.json
+credentials.json
+client_secrets.json
+data/cookies.json
+
+# Логи и временный контент
+logs/
+generated_content/
+__pycache__/
+*.tmp
+
+# База обработанных игр (чтобы не залить ваш список)
+data/processed_games.json
+data/bot_log.json
+data/products_links.json

@@ -1,0 +1,9 @@
+requests
+beautifulsoup4
+google-api-python-client
+google-auth-httplib2
+google-auth-oauthlib
+python-dotenv
+schedule
+g4f
+python-slugify
