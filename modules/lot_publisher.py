@@ -29,6 +29,48 @@ def get_category_info(session, node_id):
         return h1.get_text().replace("Продать ", "").strip() if h1 else f"Node {node_id}"
     except: return f"Node {node_id}"
 
+def _fill_select(payload, name, select_tag):
+    """
+    Умное заполнение выпадающего списка <select>.
+    Пропускает пустые плейсхолдеры (value="") и выбирает первый реальный option.
+    Для server_id — предпочитает вариант с текстом «PC» / «Все серверы» / «Все».
+    """
+    options = select_tag.find_all('option')
+    # Собираем все непустые варианты: (value, text)
+    non_empty = []
+    for opt in options:
+        val = opt.get('value', '')
+        text = opt.get_text(strip=True)
+        if val:  # value непустой — это реальный вариант, а не плейсхолдер
+            non_empty.append((val, text))
+
+    if not non_empty:
+        # Все option пустые — берём первый, какой есть
+        for opt in options:
+            val = opt.get('value', '')
+            if val:
+                payload[name] = val
+                return
+        # Вообще ничего нет — ставим пустую строку
+        payload[name] = ''
+        return
+
+    # Для server_id — ищем лучший вариант
+    low = name.lower()
+    if 'server' in low:
+        preferred_keywords = ['pc', 'все серверы', 'все', 'all', 'all servers', 'любой']
+        for val, text in non_empty:
+            if text.lower() in preferred_keywords:
+                payload[name] = val
+                return
+        # Если нет предпочтительного — берём первый непустой
+        payload[name] = non_empty[0][0]
+        return
+
+    # Для всех остальных select — первый непустой option
+    payload[name] = non_empty[0][0]
+
+
 def publish_lot(session, game_data, short_description, full_description, payment_message, price):
     try:
         node_id = str(game_data['game_id'])
@@ -67,8 +109,7 @@ def publish_lot(session, game_data, short_description, full_description, payment
             elif 'payment_msg' in low: payload[name] = p_en if '[en]' in low else payment_message
             elif 'quantity' in low or 'amount' in low: payload[name] = "999"
             if item.name == 'select':
-                for opt in item.find_all('option'):
-                    if opt.get('value'): payload[name] = opt['value']; break
+                _fill_select(payload, name, item)
             if item.get('type') == 'hidden' and name not in payload:
                 payload[name] = item.get('value', '')
 
