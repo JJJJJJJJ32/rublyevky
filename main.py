@@ -54,6 +54,7 @@ def process_single_game(session, game_data):
         folder_id = gdrive.create_folder(f"{game_name}_products")
         if not folder_id: return
 
+        fail_count = 0
         for i, idea in enumerate(final_ideas):
             print(f"📦 [{game_name}] {i+1}/{len(final_ideas)}: {idea['title']}")
             
@@ -72,6 +73,15 @@ def process_single_game(session, game_data):
             if result == "limit_reached":
                 print(f"   [!] Лимит лотов исчерпан. Переходим к следующей игре.")
                 return
+            
+            # Считаем подряд неудачные публикации — если 2 подряд None/no_csrf, категория заблокирована
+            if result in ("limit_reached", "no_csrf", None):
+                fail_count += 1
+                if fail_count >= 2:
+                    print(f"   [!] 2 неудачи подряд — категория заблокирована. Переходим к следующей игре.")
+                    return
+            else:
+                fail_count = 0
             
             if os.path.exists(file_path): os.remove(file_path)
             time.sleep(random.randint(7, 15))

@@ -93,7 +93,9 @@ def publish_lot(session, game_data, short_description, full_description, payment
             inp = soup.find('input', {'name': 'csrf_token'})
             if inp: csrf = inp.get('value')
         
-        if not csrf: return None
+        if not csrf:
+            print(f"      ❌ CSRF не найден — страница формы недоступна")
+            return "no_csrf"
 
         payload = {
             "node_id": node_id, "offer_id": "0", "location": "shop",
