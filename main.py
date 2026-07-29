@@ -68,7 +68,10 @@ def process_single_game(session, game_data):
             full = generate_full_description_ruble(idea, game_name)
             pay_msg = generate_payment_message(link)
             
-            publish_lot(session, {"game_id": game_id}, short, full, pay_msg, 1)
+            result = publish_lot(session, {"game_id": game_id}, short, full, pay_msg, 1)
+            if result == "limit_reached":
+                print(f"   [!] Лимит лотов исчерпан. Пропускаем оставшиеся товары для {game_name}.")
+                break
             
             if os.path.exists(file_path): os.remove(file_path)
             time.sleep(random.randint(7, 15))
