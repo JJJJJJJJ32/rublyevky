@@ -72,6 +72,8 @@ def process_single_game(session, game_data):
             result = publish_lot(session, {"game_id": game_id}, short, full, pay_msg, 1)
             if result == "limit_reached":
                 print(f"   [!] Лимит лотов исчерпан. Переходим к следующей игре.")
+                mark_as_processed(game_id)
+                remove_game_from_list(game_name)
                 return
             
             # Считаем подряд неудачные публикации — если 2 подряд None/no_csrf, категория заблокирована
@@ -79,6 +81,8 @@ def process_single_game(session, game_data):
                 fail_count += 1
                 if fail_count >= 2:
                     print(f"   [!] 2 неудачи подряд — категория заблокирована. Переходим к следующей игре.")
+                    mark_as_processed(game_id)
+                    remove_game_from_list(game_name)
                     return
             else:
                 fail_count = 0
