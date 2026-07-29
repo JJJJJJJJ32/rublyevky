@@ -132,10 +132,11 @@ def publish_lot(session, game_data, short_description, full_description, payment
             print(f"      ❌ ОТКАЗ: {errors}")
             # Проверяем ошибку «Много предложений» — значит лимит категории исчерпан
             if errors:
-                for err in errors:
-                    err_text = str(err)
-                    if 'много предложений' in err_text.lower() or 'много лотов' in err_text.lower() or 'too many' in err_text.lower() or 'удалите ненужные' in err_text.lower():
-                        print(f"      ⚠️ Лимит лотов в категории исчерпан — пропускаем оставшиеся товары.")
-                        return "limit_reached"
+                err_str = str(errors).lower()
+                if any(kw in err_str for kw in ['много предложений', 'много лотов', 'too many', 'удалите ненужные', 'limit']):
+                    print(f"      ⚠️ Лимит лотов в категории исчерпан — переходим к следующей игре.")
+                    return "limit_reached"
             return None
-    except: return None
+    except Exception as e:
+        print(f"      ❌ ОШИБКА publish_lot: {e}")
+        return None

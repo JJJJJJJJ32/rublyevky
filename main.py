@@ -70,8 +70,8 @@ def process_single_game(session, game_data):
             
             result = publish_lot(session, {"game_id": game_id}, short, full, pay_msg, 1)
             if result == "limit_reached":
-                print(f"   [!] Лимит лотов исчерпан. Пропускаем оставшиеся товары для {game_name}.")
-                break
+                print(f"   [!] Лимит лотов исчерпан. Переходим к следующей игре.")
+                return
             
             if os.path.exists(file_path): os.remove(file_path)
             time.sleep(random.randint(7, 15))
