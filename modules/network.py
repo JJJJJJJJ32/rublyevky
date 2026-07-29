@@ -357,34 +357,24 @@ def test_funpay_connectivity(session):
 
 def setup_network():
     """
-    Определяет оптимальную сессию для FunPay.
-    Если FunPay доступен напрямую (без VPN) — привязываем к локальному IP.
-    Если FunPay доступен только через VPN — используем обычную сессию через VPN.
+    Полная настройка сети для работы с FunPay.
+    Вызывать один раз при старте бота.
     Возвращает (session, success).
     """
     print("   [Сеть] Настройка маршрутизации FunPay...")
 
-    # 1. Пробуем напрямую (без VPN)
-    direct_session = get_direct_session()
-    if test_funpay_connectivity(direct_session):
-        print("   [Сеть] ✅ FunPay работает напрямую (минуя VPN).")
-        return direct_session, True
+    session = get_direct_session()
 
-    # 2. Пробуем через VPN (обычная сессия)
-    print("   [Сеть] FunPay недоступен напрямую. Пробуем через VPN...")
-    vpn_session = requests.Session()
-    if test_funpay_connectivity(vpn_session):
-        print("   [Сеть] ✅ FunPay работает через VPN. Используем VPN-сессию.")
-        return vpn_session, True
+    if test_funpay_connectivity(session):
+        return session, True
 
-    # 3. Fallback — системные маршруты
     print("   [Сеть] Попытка добавить системные маршруты...")
     if add_funpay_routes():
-        if test_funpay_connectivity(direct_session):
-            print("   [Сеть] ✅ FunPay работает через системные маршруты.")
-            return direct_session, True
+        if test_funpay_connectivity(session):
+            return session, True
 
-    # 4. Ничего не помогло
-    print("   [Сеть] ❌ FunPay недоступен ни напрямую, ни через VPN.")
-    print("   [Сеть]   Проверьте: VPN включён? FunPay не заблокирован?")
-    return vpn_session, False
+    print("   [Сеть] ❌ Не удалось обеспечить прямой доступ к FunPay.")
+    print("   [Сеть]   Решения:")
+    print("   [Сеть]   1. Настройте split-tunneling VPN (исключите funpay.com)")
+    print("   [Сеть]   2. Запустите бота от имени root/admin для маршрутов")
+    return session, False
