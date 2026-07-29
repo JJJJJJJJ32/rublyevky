@@ -1,6 +1,7 @@
 import time
 import random
 import os
+import atexit
 from datetime import datetime
 from slugify import slugify
 
@@ -18,9 +19,12 @@ from modules.description_builder import (
     generate_payment_message
 )
 from modules.funpay_auth import get_session
+from modules.network import setup_network, remove_funpay_routes
 from modules.lot_publisher import publish_lot, get_category_info
 from modules.duplicate_checker import is_game_processed, mark_as_processed
 from modules.category_finder import find_funpay_category
+
+atexit.register(remove_funpay_routes)
 
 MANDATORY_PRODUCTS = [
     {"title": "МАНУАЛ ПО ОПТИМИЗАЦИИ ПК ДЛЯ ИГР + НАСТРОЙКА NVIDIA BOOST FPS", "type": "мануал", "content_points": ["Настройка Win", "NVIDIA Boost", "FPS Fix"]},
@@ -50,6 +54,7 @@ def process_single_game(session, game_data):
         folder_id = gdrive.create_folder(f"{game_name}_products")
         if not folder_id: return
 
+        fail_count = 0
         for i, idea in enumerate(final_ideas):
             print(f"📦 [{game_name}] {i+1}/{len(final_ideas)}: {idea['title']}")
             
@@ -64,7 +69,19 @@ def process_single_game(session, game_data):
             full = generate_full_description_ruble(idea, game_name)
             pay_msg = generate_payment_message(link)
             
-            publish_lot(session, {"game_id": game_id}, short, full, pay_msg, 1)
+            result = publish_lot(session, {"game_id": game_id}, short, full, pay_msg, 1)
+            if result == "limit_reached":
+                print(f"   [!] Лимит лотов исчерпан. Переходим к следующей игре.")
+                return
+            
+            # Считаем подряд неудачные публикации — если 2 подряд None/no_csrf, категория заблокирована
+            if result in ("limit_reached", "no_csrf", None):
+                fail_count += 1
+                if fail_count >= 2:
+                    print(f"   [!] 2 неудачи подряд — категория заблокирована. Переходим к следующей игре.")
+                    return
+            else:
+                fail_count = 0
             
             if os.path.exists(file_path): os.remove(file_path)
             time.sleep(random.randint(7, 15))
@@ -82,9 +99,10 @@ def process_single_game(session, game_data):
 
 def main():
     print("=== FUNPAY FINAL-STABLE BOT v15.0 STARTED ===\n")
+    net_session, net_ok = setup_network()
     while True:
         try:
-            session = get_session()
+            session = get_session(network_session=net_session)
             if not session:
                 time.sleep(300); continue
             games = load_games_list()
