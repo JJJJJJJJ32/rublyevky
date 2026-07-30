@@ -59,6 +59,9 @@ def process_single_game(session, game_data):
             print(f"📦 [{game_name}] {i+1}/{len(final_ideas)}: {idea['title']}")
             
             content = ai_generate_full_content(idea, game_name)
+            if not content:
+                print(f"      ⚠️ Гайд не сгенерирован. Пропускаем товар.")
+                continue
             file_name = f"{slugify(idea['title'][:30])}_{random.randint(100,999)}.txt"
             file_path = f"generated_content/{file_name}"
             os.makedirs("generated_content", exist_ok=True)
