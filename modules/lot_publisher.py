@@ -29,6 +29,48 @@ def get_category_info(session, node_id):
         return h1.get_text().replace("Продать ", "").strip() if h1 else f"Node {node_id}"
     except: return f"Node {node_id}"
 
+def _fill_select(payload, name, select_tag):
+    """
+    Умное заполнение выпадающего списка <select>.
+    Пропускает пустые плейсхолдеры (value="") и выбирает первый реальный option.
+    Для server_id — предпочитает вариант с текстом «PC» / «Все серверы» / «Все».
+    """
+    options = select_tag.find_all('option')
+    # Собираем все непустые варианты: (value, text)
+    non_empty = []
+    for opt in options:
+        val = opt.get('value', '')
+        text = opt.get_text(strip=True)
+        if val:  # value непустой — это реальный вариант, а не плейсхолдер
+            non_empty.append((val, text))
+
+    if not non_empty:
+        # Все option пустые — берём первый, какой есть
+        for opt in options:
+            val = opt.get('value', '')
+            if val:
+                payload[name] = val
+                return
+        # Вообще ничего нет — ставим пустую строку
+        payload[name] = ''
+        return
+
+    # Для server_id — ищем лучший вариант
+    low = name.lower()
+    if 'server' in low:
+        preferred_keywords = ['pc', 'все серверы', 'все', 'all', 'all servers', 'любой']
+        for val, text in non_empty:
+            if text.lower() in preferred_keywords:
+                payload[name] = val
+                return
+        # Если нет предпочтительного — берём первый непустой
+        payload[name] = non_empty[0][0]
+        return
+
+    # Для всех остальных select — первый непустой option
+    payload[name] = non_empty[0][0]
+
+
 def publish_lot(session, game_data, short_description, full_description, payment_message, price):
     try:
         node_id = str(game_data['game_id'])
@@ -51,7 +93,9 @@ def publish_lot(session, game_data, short_description, full_description, payment
             inp = soup.find('input', {'name': 'csrf_token'})
             if inp: csrf = inp.get('value')
         
-        if not csrf: return None
+        if not csrf:
+            print(f"      ❌ CSRF не найден — страница формы недоступна")
+            return "no_csrf"
 
         payload = {
             "node_id": node_id, "offer_id": "0", "location": "shop",
@@ -60,17 +104,25 @@ def publish_lot(session, game_data, short_description, full_description, payment
 
         for item in soup.find_all(['input', 'textarea', 'select']):
             name = item.get('name')
-            if not name or 'fields' not in name or name in payload: continue
+            if not name or name in payload: continue
+
+            # <select> — всегда обрабатываем, даже если нет "fields" в имени
+            if item.name == 'select':
+                _fill_select(payload, name, item)
+                continue
+
+            # <input type="hidden"> — всегда включаем значение
+            if item.get('type') == 'hidden':
+                payload[name] = item.get('value', '')
+                continue
+
+            # Текстовые поля — только с "fields" в имени
+            if 'fields' not in name: continue
             low = name.lower()
             if 'summary' in low: payload[name] = s_en if '[en]' in low else short_description[:100]
             elif 'desc' in low: payload[name] = f_en if '[en]' in low else full_description
             elif 'payment_msg' in low: payload[name] = p_en if '[en]' in low else payment_message
             elif 'quantity' in low or 'amount' in low: payload[name] = "999"
-            if item.name == 'select':
-                for opt in item.find_all('option'):
-                    if opt.get('value'): payload[name] = opt['value']; break
-            if item.get('type') == 'hidden' and name not in payload:
-                payload[name] = item.get('value', '')
 
         response = session.post(save_url, data=payload, headers={"X-Requested-With": "XMLHttpRequest", "Referer": edit_url}, timeout=30)
         result = response.json()
@@ -78,6 +130,15 @@ def publish_lot(session, game_data, short_description, full_description, payment
             print(f"      ✅ УСПЕШНО ВЫСТАВЛЕНО!")
             return "success"
         else:
-            print(f"      ❌ ОТКАЗ: {result.get('errors')}")
+            errors = result.get('errors')
+            print(f"      ❌ ОТКАЗ: {errors}")
+            # Проверяем ошибку «Много предложений» — значит лимит категории исчерпан
+            if errors:
+                err_str = str(errors).lower()
+                if any(kw in err_str for kw in ['много предложений', 'много лотов', 'too many', 'удалите ненужные', 'limit']):
+                    print(f"      ⚠️ Лимит лотов в категории исчерпан — переходим к следующей игре.")
+                    return "limit_reached"
             return None
-    except: return None
+    except Exception as e:
+        print(f"      ❌ ОШИБКА publish_lot: {e}")
+        return None
