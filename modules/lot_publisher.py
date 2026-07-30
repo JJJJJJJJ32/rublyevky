@@ -83,6 +83,12 @@ def publish_lot(session, game_data, short_description, full_description, payment
         p_en = enforce_limits(ai_translate_to_en(payment_message), 1, 1000, is_en=True)
         
         resp = session.get(edit_url, timeout=25)
+        
+        # Проверка Cloudflare бана
+        if resp.status_code == 403 or "cf-browser-verification" in resp.text.lower() or "just a moment" in resp.text.lower() or "cloudflare" in resp.text.lower() and len(resp.text) < 5000:
+            print(f"      🚫 Cloudflare заблокировал IP. Требуется пауза.")
+            return "cloudflare_banned"
+        
         soup = BeautifulSoup(resp.text, 'html.parser')
         
         body = soup.find('body')

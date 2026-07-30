@@ -73,6 +73,13 @@ def process_single_game(session, game_data):
             pay_msg = generate_payment_message(link)
             
             result = publish_lot(session, {"game_id": game_id}, short, full, pay_msg, 1)
+            if result == "cloudflare_banned":
+                print(f"   [🚫] Cloudflare заблокировал IP. Пауза {config.CLOUDFLARE_PAUSE // 60} мин...")
+                time.sleep(config.CLOUDFLARE_PAUSE)
+                session = get_session(network_session=net_session, fresh=True)
+                if not session:
+                    time.sleep(300); return
+                continue
             if result == "limit_reached":
                 print(f"   [!] Лимит лотов исчерпан. Переходим к следующей игре.")
                 mark_as_processed(game_id)
