@@ -1,21 +1,30 @@
-import requests
 import os
+import random
 from dotenv import load_dotenv
 import time
 
 load_dotenv()
 
-def get_session():
+def get_session(network_session=None, fresh=False):
     golden_key = os.getenv("GOLDEN_KEY")
     if not golden_key:
         print("   [!] ОШИБКА: GOLDEN_KEY не найден в .env")
         return None
     
     print("   [Проверка] Авторизация на FunPay...")
-    session = requests.Session()
+    session = network_session
+
+    # Ротация сессии: если fresh=True — очищаем куки для чистого старта
+    if fresh and session:
+        session.cookies.clear()
+    
+    # Рандомный User-Agent при каждом вызове
+    import config
+    ua = random.choice(config.USER_AGENTS)
+    print(f"   [Сеть] 🎭 User-Agent: {ua[13:40]}...")
     
     session.headers.update({
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "User-Agent": ua,
         "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8",
     })
     
