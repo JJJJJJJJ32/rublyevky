@@ -6,7 +6,18 @@ import string
 from config import LIMITS
 from modules.ai_generator import ai_translate_to_en
 
-def enforce_limits(text, min_len, max_len, is_en=False, single_line=False):
+def truncate_to_bytes(text, max_bytes):
+    """Обрезает текст до max_bytes в UTF-8, не разрывая многобайтовые символы."""
+    encoded = text.encode('utf-8')
+    if len(encoded) <= max_bytes:
+        return text
+    # Обрезаем побайтово, проверяя что не разорвали символ
+    text = text[:-1]
+    while len(text.encode('utf-8')) > max_bytes:
+        text = text[:-1]
+    return text
+
+def enforce_limits(text, min_len, max_len, is_en=False, single_line=False, max_bytes=0):
     if not text: text = "Premium Gaming Service"
     if is_en:
         allowed = string.ascii_letters + string.digits + string.punctuation + " \n\r\t"
@@ -16,9 +27,13 @@ def enforce_limits(text, min_len, max_len, is_en=False, single_line=False):
         text = re.sub(r'\s+', ' ', text)
     if len(text) < min_len:
         f_ru = " Данный товар содержит проверенную информацию и экспертные тактики. Мы гарантируем 24/7 моментальную выдачу."
-        f_en = " This professional gaming service provides elite strategies and verified tips. We ensure instant automated delivery 24/7."
+        f_en = " This professional gaming service provides elite strategies and verified tips. We ensure instant automated delivery 24/7 with full support. Buy with confidence - thousands of satisfied customers trust our guides. Fast response guaranteed."
         while len(text) < min_len: text += (f_en if is_en else f_ru)
-    return text[:max_len]
+    text = text[:max_len]
+    # Байтовый лимит (FunPay считает байты для некоторых полей)
+    if max_bytes > 0:
+        text = truncate_to_bytes(text, max_bytes)
+    return text
 
 def get_category_info(session, node_id):
     try:
@@ -29,6 +44,48 @@ def get_category_info(session, node_id):
         return h1.get_text().replace("Продать ", "").strip() if h1 else f"Node {node_id}"
     except: return f"Node {node_id}"
 
+def _fill_select(payload, name, select_tag):
+    """
+    Умное заполнение выпадающего списка <select>.
+    Пропускает пустые плейсхолдеры (value="") и выбирает первый реальный option.
+    Для server_id — предпочитает вариант с текстом «PC» / «Все серверы» / «Все».
+    """
+    options = select_tag.find_all('option')
+    # Собираем все непустые варианты: (value, text)
+    non_empty = []
+    for opt in options:
+        val = opt.get('value', '')
+        text = opt.get_text(strip=True)
+        if val:  # value непустой — это реальный вариант, а не плейсхолдер
+            non_empty.append((val, text))
+
+    if not non_empty:
+        # Все option пустые — берём первый, какой есть
+        for opt in options:
+            val = opt.get('value', '')
+            if val:
+                payload[name] = val
+                return
+        # Вообще ничего нет — ставим пустую строку
+        payload[name] = ''
+        return
+
+    # Для server_id — ищем лучший вариант
+    low = name.lower()
+    if 'server' in low:
+        preferred_keywords = ['pc', 'все серверы', 'все', 'all', 'all servers', 'любой']
+        for val, text in non_empty:
+            if text.lower() in preferred_keywords:
+                payload[name] = val
+                return
+        # Если нет предпочтительного — берём первый непустой
+        payload[name] = non_empty[0][0]
+        return
+
+    # Для всех остальных select — первый непустой option
+    payload[name] = non_empty[0][0]
+
+
 def publish_lot(session, game_data, short_description, full_description, payment_message, price):
     try:
         node_id = str(game_data['game_id'])
@@ -36,11 +93,24 @@ def publish_lot(session, game_data, short_description, full_description, payment
         save_url = "https://funpay.com/lots/offerSave"
         
         # Переводы и лимиты
-        s_en = enforce_limits(ai_translate_to_en(short_description), LIMITS['summary_min'], LIMITS['summary_max'], is_en=True, single_line=True)
+        # Английский summary: одна строка, байтовый лимит
+        s_en = enforce_limits(ai_translate_to_en(short_description), LIMITS['summary_min'], LIMITS['summary_max'], is_en=True, single_line=True, max_bytes=LIMITS['summary_max_bytes'])
+        # Русский summary: тоже обрезаем по байтам
+        s_ru = enforce_limits(short_description, LIMITS['summary_min'], LIMITS['summary_max'], is_en=False, single_line=True, max_bytes=LIMITS['summary_max_bytes'])
+        # Английский description: минимум 500 символов
         f_en = enforce_limits(ai_translate_to_en(full_description), LIMITS['description_min_en'], 3000, is_en=True)
-        p_en = enforce_limits(ai_translate_to_en(payment_message), 1, 1000, is_en=True)
+        # Русский description: без изменений
+        f_ru = full_description
+        # Английский payment_msg: минимум 300 символов
+        p_en = enforce_limits(ai_translate_to_en(payment_message), LIMITS.get('payment_msg_min_en', 300), LIMITS['payment_msg_max'], is_en=True)
         
         resp = session.get(edit_url, timeout=25)
+        
+        # Проверка Cloudflare бана
+        if resp.status_code == 403 or "cf-browser-verification" in resp.text.lower() or "just a moment" in resp.text.lower() or "cloudflare" in resp.text.lower() and len(resp.text) < 5000:
+            print(f"      🚫 Cloudflare заблокировал IP. Требуется пауза.")
+            return "cloudflare_banned"
+        
         soup = BeautifulSoup(resp.text, 'html.parser')
         
         body = soup.find('body')
@@ -51,7 +121,9 @@ def publish_lot(session, game_data, short_description, full_description, payment
             inp = soup.find('input', {'name': 'csrf_token'})
             if inp: csrf = inp.get('value')
         
-        if not csrf: return None
+        if not csrf:
+            print(f"      ❌ CSRF не найден — страница формы недоступна")
+            return "no_csrf"
 
         payload = {
             "node_id": node_id, "offer_id": "0", "location": "shop",
@@ -60,17 +132,25 @@ def publish_lot(session, game_data, short_description, full_description, payment
 
         for item in soup.find_all(['input', 'textarea', 'select']):
             name = item.get('name')
-            if not name or 'fields' not in name or name in payload: continue
+            if not name or name in payload: continue
+
+            # <select> — всегда обрабатываем, даже если нет "fields" в имени
+            if item.name == 'select':
+                _fill_select(payload, name, item)
+                continue
+
+            # <input type="hidden"> — всегда включаем значение
+            if item.get('type') == 'hidden':
+                payload[name] = item.get('value', '')
+                continue
+
+            # Текстовые поля — только с "fields" в имени
+            if 'fields' not in name: continue
             low = name.lower()
-            if 'summary' in low: payload[name] = s_en if '[en]' in low else short_description[:100]
-            elif 'desc' in low: payload[name] = f_en if '[en]' in low else full_description
+            if 'summary' in low: payload[name] = s_en if '[en]' in low else s_ru
+            elif 'desc' in low: payload[name] = f_en if '[en]' in low else f_ru
             elif 'payment_msg' in low: payload[name] = p_en if '[en]' in low else payment_message
             elif 'quantity' in low or 'amount' in low: payload[name] = "999"
-            if item.name == 'select':
-                for opt in item.find_all('option'):
-                    if opt.get('value'): payload[name] = opt['value']; break
-            if item.get('type') == 'hidden' and name not in payload:
-                payload[name] = item.get('value', '')
 
         response = session.post(save_url, data=payload, headers={"X-Requested-With": "XMLHttpRequest", "Referer": edit_url}, timeout=30)
         result = response.json()
@@ -78,6 +158,24 @@ def publish_lot(session, game_data, short_description, full_description, payment
             print(f"      ✅ УСПЕШНО ВЫСТАВЛЕНО!")
             return "success"
         else:
-            print(f"      ❌ ОТКАЗ: {result.get('errors')}")
+            errors = result.get('errors')
+            print(f"      ❌ ОТКАЗ: {errors}")
+            # Проверяем ошибку «Много предложений» — значит лимит категории исчерпан
+            if errors:
+                err_str = str(errors).lower()
+                if any(kw in err_str for kw in ['много предложений', 'много лотов', 'too many', 'удалите ненужные', 'limit']):
+                    print(f"      ⚠️ Лимит лотов в категории исчерпан — переходим к следующей игре.")
+                    return "limit_reached"
+                # Короткий английский текст — можно попробовать перезаполнить
+                if 'короткого английского' in err_str or 'too short' in err_str:
+                    return "too_short_en"
+                # Длинный русский текст — можно попробовать обрезать
+                if 'слишком длинный' in err_str or 'too long' in err_str:
+                    return "too_long_ru"
             return None
-    except: return None
+    except requests.exceptions.ConnectionError as e:
+        print(f"      ❌ ОШИБКА СЕТИ: {e}")
+        return "network_error"
+    except Exception as e:
+        print(f"      ❌ ОШИБКА publish_lot: {e}")
+        return None
