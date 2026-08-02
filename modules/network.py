@@ -363,18 +363,26 @@ def setup_network():
     """
     print("   [Сеть] Настройка маршрутизации FunPay...")
 
-    session = get_direct_session()
+    # 1. Пробуем напрямую (минуя VPN) — если FunPay не заблокирован
+    direct_session = get_direct_session()
+    if test_funpay_connectivity(direct_session):
+        return direct_session, True
 
-    if test_funpay_connectivity(session):
-        return session, True
+    # 2. Пробуем через обычную сессию — если WARP или другой VPN пропускает
+    print("   [Сеть] Прямой доступ не работает. Пробуем через VPN/WARP...")
+    vpn_session = requests.Session()
+    if test_funpay_connectivity(vpn_session):
+        print("   [Сеть] ✅ FunPay доступен через VPN/WARP. Используем эту сессию.")
+        return vpn_session, True
 
+    # 3. Пробуем системные маршруты
     print("   [Сеть] Попытка добавить системные маршруты...")
     if add_funpay_routes():
-        if test_funpay_connectivity(session):
-            return session, True
+        if test_funpay_connectivity(direct_session):
+            return direct_session, True
 
-    print("   [Сеть] ❌ Не удалось обеспечить прямой доступ к FunPay.")
+    print("   [Сеть] ❌ Не удалось подключиться к FunPay.")
     print("   [Сеть]   Решения:")
-    print("   [Сеть]   1. Настройте split-tunneling VPN (исключите funpay.com)")
-    print("   [Сеть]   2. Запустите бота от имени root/admin для маршрутов")
-    return session, False
+    print("   [Сеть]   1. Настройте Запрет + WARP (см. README)")
+    print("   [Сеть]   2. Настройте split-tunneling VPN (исключите funpay.com)")
+    return vpn_session, False
