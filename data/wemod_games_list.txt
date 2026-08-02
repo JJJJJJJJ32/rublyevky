@@ -1,14 +1,13 @@
 7 Days to Die
-Age of Empires IV
-Age of Mythology: Retold
-Alan Wake II
+Alan Wake 2
 Alien Isolation
-American Truck Simulator
 Anno 1800
 ARK: Survival Ascended
 ARK: Survival Evolved
+Armored Core VI: Fires of Rubicon
 Assassin's Creed Mirage
 Assassin's Creed Odyssey
+Assassin's Creed Shadows
 Assassin's Creed Valhalla
 Baldur's Gate 3
 Batman: Arkham Knight
@@ -17,7 +16,6 @@ Borderlands 3
 Car Mechanic Simulator 2021
 Cities: Skylines II
 Civilization VI
-Command & Conquer Remastered Collection
 Company of Heroes 3
 Conan Exiles
 Contraband Police
@@ -28,9 +26,11 @@ Dark Souls III
 Days Gone
 Dead Island 2
 Death Stranding Director's Cut
+Deathloop
 Deus Ex: Mankind Divided
 Dishonored 2
 Doom Eternal
+Doom: The Dark Ages
 Dragon Age: The Veilguard
 Dragon's Dogma II
 Dying Light 2
@@ -43,7 +43,9 @@ Fallout 4
 Far Cry 5
 Far Cry 6
 Farming Simulator 22
+Farming Simulator 25
 Final Fantasy VII Remake
+Final Fantasy XVI
 Garry's Mod
 Ghost of Tsushima Director's Cut
 Ghost Recon Breakpoint
@@ -57,14 +59,13 @@ House Flipper 2
 Just Cause 4
 Kerbal Space Program
 Kingdom Come: Deliverance
+Kingdom Come: Deliverance 2
 Lethal Company
 Lies of P
 Like a Dragon: Infinite Wealth
 Mafia: Definitive Edition
 Mass Effect Legendary Edition
 Microsoft Flight Simulator 2020
-Minecraft Dungeons
-Minecraft Legends
 Monster Hunter World
 Monster Hunter Wilds
 Mount & Blade II: Bannerlord
@@ -96,6 +97,7 @@ Spider-Man: Miles Morales
 Starfield
 Stardew Valley
 State of Decay 2
+STALKER 2
 Subnautica
 Subnautica: Below Zero
 Terraria
