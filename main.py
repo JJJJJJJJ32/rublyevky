@@ -35,28 +35,11 @@ MANDATORY_PRODUCTS = [
     {"title": "[ СПОСОБ СНЯТЬ БЛОКИРОВКУ С ЖЕЛЕЗА ] [ СМЕНА HWID IP MAC АДРЕС UUID ]", "type": "чит-лист", "content_points": ["HWID", "IP", "MAC", "UUID"]}
 ]
 
-def _reconnect_session(net_session):
-    """Пытается пересоздать сессию при обрыве связи. Возвращает новую сессию или None."""
-    print("   [Сеть] 🔄 Переподключение к FunPay...")
-    # Пауза перед повторной попыткой — WARP может восстанавливаться
-    for wait in [10, 30, 60]:
-        time.sleep(wait)
-        try:
-            session = get_session(network_session=net_session, fresh=True)
-            if session:
-                print("   [Сеть] ✅ Подключение восстановлено!")
-                return session
-        except Exception as e:
-            print(f"   [Сеть] ❌ Попытка не удалась: {e}")
-    print("   [Сеть] ❌ Не удалось восстановить подключение за 3 попытки.")
-    return None
-
 def _heal_and_reconnect(net_session):
     """Чинит сеть (WARP, маршруты) и пересоздаёт сессию. Возвращает (session, net_session)."""
     print("   [Сеть] 🔧 Сеть отвалилась! Запускаем авто-починку...")
     new_session, ok = heal_network()
     if ok:
-        # Обновляем net_session на новую сессию
         net_session = new_session
         session = get_session(network_session=net_session, fresh=True)
         if session:
@@ -72,6 +55,34 @@ def _heal_and_reconnect(net_session):
         time.sleep(300)
         session = get_session(network_session=net_session, fresh=True)
         return session, net_session
+
+def _publish_with_heal(session, net_session, game_id, short, full, pay_msg, price, max_heal_attempts=3):
+    """
+    Публикует лот с авто-починкой сети при обрывах.
+    Если сеть отваливается — чинит и ПРОБУЕТ СНОВА тот же лот.
+    НЕ пропускает игру! Возвращает (result, session, net_session).
+    """
+    for heal_attempt in range(max_heal_attempts):
+        result = publish_lot(session, {"game_id": game_id}, short, full, pay_msg, price)
+        
+        if result != "network_error":
+            return result, session, net_session
+        
+        # Сеть отвалилась — чиним и пробуем ещё раз
+        print(f"   [Сеть] ⚠️ Сетевая ошибка (попытка починки {heal_attempt+1}/{max_heal_attempts})...")
+        session, net_session = _heal_and_reconnect(net_session)
+        
+        if not session:
+            print("   [Сеть] ❌ Не удалось восстановить сессию. Ждём 3 мин и пробуем снова...")
+            time.sleep(180)
+            session = get_session(network_session=net_session, fresh=True)
+            if not session:
+                continue
+        # Если сессия восстановлена — пробуем опубликовать лот ещё раз (цикл продолжится)
+    
+    # После всех попыток починки — последняя попытка публикации
+    result = publish_lot(session, {"game_id": game_id}, short, full, pay_msg, price)
+    return result, session, net_session
 
 def process_single_game(session, game_data, net_session):
     game_name = game_data['game_name']
@@ -96,7 +107,6 @@ def process_single_game(session, game_data, net_session):
         if not folder_id: return session, net_session
 
         fail_count = 0
-        network_errors = 0  # Счётчик сетевых ошибок подряд
         for i, idea in enumerate(final_ideas):
             print(f"📦 [{game_name}] {i+1}/{len(final_ideas)}: {idea['title']}")
             
@@ -114,36 +124,10 @@ def process_single_game(session, game_data, net_session):
             full = generate_full_description_ruble(idea, game_name)
             pay_msg = generate_payment_message(link)
             
-            result = publish_lot(session, {"game_id": game_id}, short, full, pay_msg, 1)
-            
-            # Сетевая ошибка — чиним сеть автоматически
-            if result == "network_error":
-                network_errors += 1
-                if network_errors >= 2:
-                    # АВТО-ПОЧИНКА: чиним WARP, удаляем маршруты, пересоздаём сессию
-                    session, net_session = _heal_and_reconnect(net_session)
-                    if session:
-                        network_errors = 0
-                        # Перепробуем этот лот с новой сессией
-                        result = publish_lot(session, {"game_id": game_id}, short, full, pay_msg, 1)
-                        if result == "network_error":
-                            print(f"   [!] Сеть снова отвалилась. Пропускаем игру.")
-                            mark_as_processed(game_id)
-                            remove_game_from_list(game_name)
-                            return session, net_session
-                    else:
-                        print(f"   [!] Не удалось восстановить сеть. Пропускаем игру.")
-                        mark_as_processed(game_id)
-                        remove_game_from_list(game_name)
-                        return session, net_session
-                else:
-                    fail_count += 1
-                    if fail_count >= 3:
-                        print(f"   [!] 3 неудачи подряд. Переходим к следующей игре.")
-                        mark_as_processed(game_id)
-                        remove_game_from_list(game_name)
-                        return session, net_session
-                    continue
+            # Публикуем с авто-починкой — бот НЕ пропускает игру при обрывах!
+            result, session, net_session = _publish_with_heal(
+                session, net_session, game_id, short, full, pay_msg, 1
+            )
             
             if result == "cloudflare_banned":
                 print(f"   [🚫] Cloudflare заблокировал IP. Пауза {config.CLOUDFLARE_PAUSE // 60} мин...")
@@ -158,18 +142,17 @@ def process_single_game(session, game_data, net_session):
                 remove_game_from_list(game_name)
                 return session, net_session
             
-            # Короткий английский текст — не считается неудачей, просто пропускаем
+            # Короткий английский текст — не считается неудачей
             if result == "too_short_en":
-                print(f"      ⚠️ Английский текст слишком короткий. FunPay отклонил. Пропускаем.")
+                print(f"      ⚠️ Английский текст слишком короткий. Пропускаем товар.")
                 continue
             
-            # Длинный русский текст — не считается неудачей, просто пропускаем
+            # Длинный русский текст — не считается неудачей
             if result == "too_long_ru":
-                print(f"      ⚠️ Русский текст слишком длинный. FunPay отклонил. Пропускаем.")
+                print(f"      ⚠️ Русский текст слишком длинный. Пропускаем товар.")
                 continue
             
             # Считаем подряд неудачные публикации БЕЗ конкретной ошибки
-            # (no_csrf = FunPay заблокировал, None = другая ошибка)
             if result in ("no_csrf", None):
                 fail_count += 1
                 if fail_count >= 3:
@@ -179,17 +162,18 @@ def process_single_game(session, game_data, net_session):
                     return session, net_session
             else:
                 fail_count = 0
-                network_errors = 0
             
             if os.path.exists(file_path): os.remove(file_path)
             time.sleep(random.randint(7, 15))
 
         if check_wemod_availability(game_name):
             print(f"💎 СОЗДАНИЕ WEMOD...")
-            wemod_result = publish_lot(session, {"game_id": game_id}, generate_short_description_wemod(game_name), generate_full_description_wemod(game_name), generate_payment_message(config.WEMOD_FIXED_LINK), 60)
-            if wemod_result == "network_error":
-                print(f"      ⚠️ Сетевая ошибка при публикации WeMod. Чиним сеть...")
-                session, net_session = _heal_and_reconnect(net_session)
+            wemod_result, session, net_session = _publish_with_heal(
+                session, net_session, game_id,
+                generate_short_description_wemod(game_name),
+                generate_full_description_wemod(game_name),
+                generate_payment_message(config.WEMOD_FIXED_LINK), 60
+            )
 
         mark_as_processed(game_id)
         remove_game_from_list(game_name)
@@ -201,7 +185,7 @@ def process_single_game(session, game_data, net_session):
     return session, net_session
 
 def main():
-    print("=== FUNPAY FINAL-STABLE BOT v15.0 STARTED ===\n")
+    print("=== FUNPAY FINAL-STABLE BOT v18.0 STARTED ===\n")
     net_session, net_ok = setup_network()
     
     # Подсказка про WARP

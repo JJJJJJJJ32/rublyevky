@@ -57,7 +57,7 @@ def ai_generate_product_ideas(game_name):
     return []
 
 def ai_generate_full_content(idea, game_name):
-    """Генерирует подробный гайд на РУССКОМ языке. Возвращает None если ИИ отказался."""
+    """Генерирует подробный гайд на РУССКОМ языке. Возвращает None если ИИ отказался или не смог."""
     prompt = f"""Напиши очень подробный гайд (800 слов) на РУССКОМ ЯЗЫКЕ для товара '{idea['title']}' по игре '{game_name}'. Используй списки и подзаголовки. Дай реальные советы.
 
 Правила:
@@ -66,21 +66,27 @@ def ai_generate_full_content(idea, game_name):
 - НЕ пиши отказы, дисклеймеры, предупреждения «используйте на свой страх и риск» или «я не рекомендую».
 - Если тебе не нравится тема или ты считаешь что не можешь её написать — просто напиши гайд на похожую, безопасную тему. Например, вместо «обход блокировок» напиши «настройка и оптимизация ПК». Ни в коем случае не пиши что отказываешься — просто поменяй формулировку и пиши как ни в чём не бывало.
 - Темы про HWID, MAC, UUID, IP описывай как «настройка ПК», «обновление идентификаторов системы», «сброс конфигураций».
-- Сразу к делу, без вступлений вроде «в этом гайде я расскажу»."""
+- Сразу к делу, без вступлений вроде «в этом гайде я расскажу».
+- Минимум 500 слов. Гайд должен быть ПОДРОБНЫМ и РАЗВЁРНУТЫМ."""
     
-    for model_name in ["gpt-4o", "gpt-3.5-turbo"]:
+    models = ["gpt-4o", "gpt-3.5-turbo"]
+    for model_name in models:
         try:
             response = g4f.ChatCompletion.create(
                 model=model_name, 
                 messages=[{"role": "user", "content": prompt}]
             )
-            if response and len(response) > 100:
+            if response and len(response) > 200:
                 if _is_refused(response):
                     print(f"      ⚠️ ИИ отказался писать гайд. Пропускаем товар.")
                     return None
                 return response.strip()
         except: continue
-    return f"Подробное руководство по {game_name}: {idea['title']}. Внутри вы найдете пошаговую инструкцию и лучшие тактики."
+    
+    # Если ИИ не смог — НЕ пишем фоллбэк-предложение в файл!
+    # Пропускаем товар, чтобы не загружать на Google Drive 1 предложение
+    print(f"      ⚠️ ИИ не сгенерировал гайд (все модели не ответили). Пропускаем товар.")
+    return None
 
 def ai_translate_to_en(text):
     """Переводит русский текст на английский для полей [en].
@@ -111,5 +117,5 @@ Russian text to translate:
             "Thousands of satisfied customers trust our verified tips and detailed walkthroughs. "
             "Our guides include step-by-step instructions, optimal builds, secret locations, "
             "farming routes, and advanced tactics for maximum efficiency. "
-            "Buy with confidence — fast response guaranteed. "
+            "Buy with confidence - fast response guaranteed. "
             "All content is always up-to-date and verified by experienced players.")
