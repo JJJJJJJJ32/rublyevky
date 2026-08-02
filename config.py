@@ -3,7 +3,8 @@ LIMITS = {
     "summary_min": 10,
     "summary_max": 100,
     "description_min_ru": 200,
-    "description_min_en": 300, # Английское должно быть длиннее
+    "description_min_en": 300,
+    "payment_msg_min_en": 300,  # FunPay требует минимум 300 символов для английских полей
     "payment_msg_max": 1000
 }
 

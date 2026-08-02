@@ -80,7 +80,7 @@ def publish_lot(session, game_data, short_description, full_description, payment
         # Переводы и лимиты
         s_en = enforce_limits(ai_translate_to_en(short_description), LIMITS['summary_min'], LIMITS['summary_max'], is_en=True, single_line=True)
         f_en = enforce_limits(ai_translate_to_en(full_description), LIMITS['description_min_en'], 3000, is_en=True)
-        p_en = enforce_limits(ai_translate_to_en(payment_message), 1, 1000, is_en=True)
+        p_en = enforce_limits(ai_translate_to_en(payment_message), LIMITS.get('payment_msg_min_en', 300), LIMITS['payment_msg_max'], is_en=True)
         
         resp = session.get(edit_url, timeout=25)
         

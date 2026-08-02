@@ -86,11 +86,12 @@ def process_single_game(session, game_data):
                 remove_game_from_list(game_name)
                 return
             
-            # Считаем подряд неудачные публикации — если 2 подряд None/no_csrf, категория заблокирована
-            if result in ("limit_reached", "no_csrf", None):
+            # Считаем подряд неудачные публикации БЕЗ конкретной ошибки
+            # (no_csrf = FunPay заблокировал, None = другая ошибка)
+            if result in ("no_csrf", None):
                 fail_count += 1
-                if fail_count >= 2:
-                    print(f"   [!] 2 неудачи подряд — категория заблокирована. Переходим к следующей игре.")
+                if fail_count >= 3:
+                    print(f"   [!] 3 неудачи подряд без ответа. Переходим к следующей игре.")
                     mark_as_processed(game_id)
                     remove_game_from_list(game_name)
                     return
