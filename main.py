@@ -19,7 +19,10 @@ from modules.description_builder import (
     generate_payment_message
 )
 from modules.funpay_auth import get_session
-from modules.network import setup_network, remove_funpay_routes, make_warp_session, is_warp_active
+from modules.network import (
+    setup_network, remove_funpay_routes, make_warp_session, 
+    is_warp_active, heal_network, cleanup_all_funpay_routes
+)
 from modules.lot_publisher import publish_lot, get_category_info
 from modules.duplicate_checker import is_game_processed, mark_as_processed
 from modules.category_finder import find_funpay_category
@@ -48,16 +51,38 @@ def _reconnect_session(net_session):
     print("   [Сеть] ❌ Не удалось восстановить подключение за 3 попытки.")
     return None
 
+def _heal_and_reconnect(net_session):
+    """Чинит сеть (WARP, маршруты) и пересоздаёт сессию. Возвращает (session, net_session)."""
+    print("   [Сеть] 🔧 Сеть отвалилась! Запускаем авто-починку...")
+    new_session, ok = heal_network()
+    if ok:
+        # Обновляем net_session на новую сессию
+        net_session = new_session
+        session = get_session(network_session=net_session, fresh=True)
+        if session:
+            print("   [Сеть] ✅ Сеть починена, авторизация восстановлена!")
+            return session, net_session
+        else:
+            print("   [Сеть] ⚠️ Сеть починена, но авторизация не удалась. Ждём 2 мин...")
+            time.sleep(120)
+            session = get_session(network_session=net_session, fresh=True)
+            return session, net_session
+    else:
+        print("   [Сеть] ❌ Авто-починка не помогла. Ждём 5 мин...")
+        time.sleep(300)
+        session = get_session(network_session=net_session, fresh=True)
+        return session, net_session
+
 def process_single_game(session, game_data, net_session):
     game_name = game_data['game_name']
     found = find_funpay_category(session, game_name)
     if not found:
         print(f"   [!] Игра '{game_name}' не найдена. Пропуск.")
-        remove_game_from_list(game_name); return session
+        remove_game_from_list(game_name); return session, net_session
     
     game_id = found['id']
     if is_game_processed(game_id):
-        remove_game_from_list(game_name); return session
+        remove_game_from_list(game_name); return session, net_session
 
     print(f"\n🌍 РАЗДЕЛ: {get_category_info(session, game_id)} ({found['type']})")
     print(f"📊 ИГРА: {game_name.upper()}")
@@ -68,7 +93,7 @@ def process_single_game(session, game_data, net_session):
 
     try:
         folder_id = gdrive.create_folder(f"{game_name}_products")
-        if not folder_id: return session
+        if not folder_id: return session, net_session
 
         fail_count = 0
         network_errors = 0  # Счётчик сетевых ошибок подряд
@@ -91,29 +116,33 @@ def process_single_game(session, game_data, net_session):
             
             result = publish_lot(session, {"game_id": game_id}, short, full, pay_msg, 1)
             
-            # Сетевая ошибка — пробуем переподключиться
+            # Сетевая ошибка — чиним сеть автоматически
             if result == "network_error":
                 network_errors += 1
                 if network_errors >= 2:
-                    print(f"   [!] Сеть отвалилась. Пробуем переподключиться...")
-                    new_session = _reconnect_session(net_session)
-                    if new_session:
-                        session = new_session
+                    # АВТО-ПОЧИНКА: чиним WARP, удаляем маршруты, пересоздаём сессию
+                    session, net_session = _heal_and_reconnect(net_session)
+                    if session:
                         network_errors = 0
                         # Перепробуем этот лот с новой сессией
                         result = publish_lot(session, {"game_id": game_id}, short, full, pay_msg, 1)
+                        if result == "network_error":
+                            print(f"   [!] Сеть снова отвалилась. Пропускаем игру.")
+                            mark_as_processed(game_id)
+                            remove_game_from_list(game_name)
+                            return session, net_session
                     else:
                         print(f"   [!] Не удалось восстановить сеть. Пропускаем игру.")
                         mark_as_processed(game_id)
                         remove_game_from_list(game_name)
-                        return session
+                        return session, net_session
                 else:
                     fail_count += 1
                     if fail_count >= 3:
                         print(f"   [!] 3 неудачи подряд. Переходим к следующей игре.")
                         mark_as_processed(game_id)
                         remove_game_from_list(game_name)
-                        return session
+                        return session, net_session
                     continue
             
             if result == "cloudflare_banned":
@@ -121,13 +150,13 @@ def process_single_game(session, game_data, net_session):
                 time.sleep(config.CLOUDFLARE_PAUSE)
                 session = get_session(network_session=net_session, fresh=True)
                 if not session:
-                    time.sleep(300); return session
+                    time.sleep(300); return session, net_session
                 continue
             if result == "limit_reached":
                 print(f"   [!] Лимит лотов исчерпан. Переходим к следующей игре.")
                 mark_as_processed(game_id)
                 remove_game_from_list(game_name)
-                return session
+                return session, net_session
             
             # Короткий английский текст — не считается неудачей, просто пропускаем
             if result == "too_short_en":
@@ -147,7 +176,7 @@ def process_single_game(session, game_data, net_session):
                     print(f"   [!] 3 неудачи подряд без ответа. Переходим к следующей игре.")
                     mark_as_processed(game_id)
                     remove_game_from_list(game_name)
-                    return session
+                    return session, net_session
             else:
                 fail_count = 0
                 network_errors = 0
@@ -159,10 +188,8 @@ def process_single_game(session, game_data, net_session):
             print(f"💎 СОЗДАНИЕ WEMOD...")
             wemod_result = publish_lot(session, {"game_id": game_id}, generate_short_description_wemod(game_name), generate_full_description_wemod(game_name), generate_payment_message(config.WEMOD_FIXED_LINK), 60)
             if wemod_result == "network_error":
-                print(f"      ⚠️ Сетевая ошибка при публикации WeMod. Пробуем переподключиться...")
-                new_session = _reconnect_session(net_session)
-                if new_session:
-                    session = new_session
+                print(f"      ⚠️ Сетевая ошибка при публикации WeMod. Чиним сеть...")
+                session, net_session = _heal_and_reconnect(net_session)
 
         mark_as_processed(game_id)
         remove_game_from_list(game_name)
@@ -171,7 +198,7 @@ def process_single_game(session, game_data, net_session):
         print(f"   [!] Ошибка в игре: {e}")
         remove_game_from_list(game_name)
     
-    return session
+    return session, net_session
 
 def main():
     print("=== FUNPAY FINAL-STABLE BOT v15.0 STARTED ===\n")
@@ -186,12 +213,15 @@ def main():
         try:
             session = get_session(network_session=net_session)
             if not session:
-                print("   [!] Не удалось авторизоваться. Ждём 5 мин...")
-                time.sleep(300); continue
+                print("   [!] Не удалось авторизоваться. Пробуем авто-починку...")
+                session, net_session = _heal_and_reconnect(net_session)
+                if not session:
+                    print("   [!] Ждём 5 мин...")
+                    time.sleep(300); continue
             games = load_games_list()
             if not games:
                 print("🛌 Список пуст. Ожидание..."); time.sleep(3600); continue
-            session = process_single_game(session, games[0], net_session)
+            session, net_session = process_single_game(session, games[0], net_session)
             time.sleep(5)
         except KeyboardInterrupt: break
         except Exception as e:
