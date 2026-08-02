@@ -53,7 +53,9 @@
 ### Шаг 4: Создай файл .env
 
 1. В папке с ботом создай файл с названием `.env` (именно так, с точкой в начале)
-2. Открой его в блокноте и напиши:
+   - **Как создать:** открой блокнот → Файл → Сохранить как → в поле «Имя файла» напиши `.env` → в поле «Тип файла» выбери «Все файлы» → Сохрани в папку с ботом
+   - ⚠️ Если назвать файл `.env.txt` — бот не найдёт его! Убедись что файл называется именно `.env`
+2. Открой файл `.env` в блокноте и напиши:
    ```
    GOLDEN_KEY=твой_золотой_ключ_от_funpay
    GOOGLE_DRIVE_FOLDER_ID=айди_папки_на_google_drive
@@ -72,22 +74,28 @@
 ### Шаг 5: Настрой Google Drive
 
 1. Перейди на [Google Cloud Console](https://console.cloud.google.com/)
-2. Создай новый проект
+2. Создай новый проект:
+   - Вверху слева нажми на название проекта → «New Project» → введи любое имя → «Create»
 3. Включи Google Drive API:
-   - Меню слева → APIs & Services → Library
-   - Найди «Google Drive API» → Включи
+   - Меню слева (три полоски) → APIs & Services → Library
+   - Введи в поиск «Google Drive API» → нажми на него → «Enable»
 4. Создай Service Account:
    - Меню слева → APIs & Services → Credentials
-   - «Create Credentials» → «Service Account»
-   - Заполни имя → «Create and Continue» → «Done»
+   - Нажми «Create Credentials» вверху → «Service Account»
+   - Введи любое имя (например `funpay-bot`) → «Create and Continue» → «Done»
 5. Скачай ключ:
-   - Кликни на созданный Service Account
-   - Вкладка «Keys» → «Add Key» → «Create new key» → JSON → «Create»
-   - Скачается файл — переименуй его в `client_secrets.json` и положи в папку с ботом
+   - Нажми на созданный Service Account в списке
+   - Перейди на вкладку «Keys» вверху
+   - «Add Key» → «Create new key» → выбери «JSON» → «Create»
+   - Скачается файл — **переименуй его в `client_secrets.json`** и положи в папку с ботом
+   - ⚠️ Файл должен называться именно `client_secrets.json`, а не как-то иначе
 6. Поделись папкой Google Drive с Service Account:
-   - Открой почту Service Account (вкладка «Details» — там будет email вида `xxx@xxx.iam.gserviceaccount.com`)
-   - Скопируй этот email
-   - На Google Drive: открой свою папку → «Поделиться» → вставь email → дай права «Редактор»
+   - В том же Service Account перейди на вкладку «Details»
+   - Скопируй email (он выглядит так: `funpay-bot@твой-проект.iam.gserviceaccount.com`)
+   - Открой Google Drive → правой кнопкой на свою папку → «Поделиться»
+   - Вставь этот email → выбери «Редактор» → «Отправить»
+
+> **Примечание:** При первом запуске бота откроется браузер и попросит авторизоваться в Google — разреши доступ. После этого создастся файл `token.json` — его не удаляй, он нужен для работы.
 
 ### Шаг 6: Настрой список игр
 
@@ -211,21 +219,22 @@
 
 ```
 rublyevky/
-├── main.py              ← Главный файл бота (запускать его)
-├── config.py            ← Настройки (лимиты, эмодзи, User-Agent)
-├── .env                 ← Твои секретные ключи (Golden Key, Google Drive)
-├── client_secrets.json  ← Ключ от Google Cloud
-├── requirements.txt     ← Список библиотек для установки
+├── main.py                    ← Главный файл бота (запускать его)
+├── config.py                  ← Настройки (лимиты, эмодзи, User-Agent)
+├── .env                       ← Твои секретные ключи (Golden Key, Google Drive)
+├── client_secrets.json        ← Ключ от Google Cloud (скачиваешь из консоли)
+├── token.json                 ← Создаётся автоматически после первой авторизации Google (НЕ удаляй!)
+├── requirements.txt           ← Список библиотек для установки
 │
 ├── data/
 │   ├── games_list.txt          ← Список игр для обработки
 │   ├── wemod_games_list.txt    ← Список игр в WeMod
-│   └── processed_games.json    ← Уже обработанные игры (не трогать)
+│   └── processed_games.json    ← Уже обработанные игры (не трогать, создаётся автоматически)
 │
 ├── modules/
 │   ├── ai_generator.py    ← Генерация текстов через ИИ
 │   ├── lot_publisher.py   ← Публикация лотов на FunPay
-│   ├── funpay_auth.py     ← Авторизация на FunPay
+│   ├── funpay_auth.py     ← Авторизация на FunPay (через Golden Key)
 │   ├── category_finder.py ← Поиск категории на FunPay
 │   ├── description_builder.py ← Создание описаний лотов
 │   ├── gdrive_manager.py  ← Работа с Google Drive
