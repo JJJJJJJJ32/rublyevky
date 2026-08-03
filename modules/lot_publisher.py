@@ -7,15 +7,30 @@ from config import LIMITS
 from modules.ai_generator import ai_translate_to_en
 
 def truncate_to_bytes(text, max_bytes):
-    """Обрезает текст до max_bytes в UTF-8, не разрывая многобайтовые символы."""
+    """Обрезает текст до max_bytes в UTF-8, не разрывая многобайтовые символы
+    и не отрывая variation selector (U+FE0F) от базового символа."""
     encoded = text.encode('utf-8')
     if len(encoded) <= max_bytes:
         return text
-    # Обрезаем побайтово, проверяя что не разорвали символ
-    text = text[:-1]
-    while len(text.encode('utf-8')) > max_bytes:
-        text = text[:-1]
-    return text
+    # Собираем "кластеры" символов: базовый + variation selector вместе
+    clusters = []
+    i = 0
+    while i < len(text):
+        char = text[i]
+        cluster = char
+        # Если следующий символ — variation selector (U+FE0F), объединяем
+        while i + 1 < len(text) and text[i + 1] == '\uFE0F':
+            i += 1
+            cluster += text[i]
+        clusters.append(cluster)
+        i += 1
+    # Теперь собираем результат по кластерам
+    result = ""
+    for cluster in clusters:
+        if len((result + cluster).encode('utf-8')) > max_bytes:
+            break
+        result += cluster
+    return result
 
 def enforce_limits(text, min_len, max_len, is_en=False, single_line=False, max_bytes=0):
     if not text: text = "Premium Gaming Service"
