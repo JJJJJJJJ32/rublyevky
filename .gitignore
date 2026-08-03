@@ -14,4 +14,6 @@ __pycache__/
 # База обработанных игр (чтобы не залить ваш список)
 data/processed_games.json
 data/bot_log.json
-data/products_links.json
+data/products_links.json.venv/
+__pycache__/
+.pytest_cache/
