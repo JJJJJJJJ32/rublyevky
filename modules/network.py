@@ -87,7 +87,7 @@ def is_zapret_active():
 
 
 def _find_zapret_dir():
-    """Ищет папку Zapret на диске. Имя может быть ЛЮБЫМ — главное чтобы внутри был winws.exe.
+    """Ищет папку Zapret на диске. Имя может быть ЛЮБЫМ — главное чтобы внутри были признаки Zapret.
     Ищет в: папка проекта, Desktop, C:/, D:/, домашняя папка.
     Возвращает путь или None."""
     global _zapret_path
@@ -110,7 +110,8 @@ def _find_zapret_dir():
 
     # Потом ищем ЛЮБУЮ папку содержащую "zapret" в имени
     search_roots = [
-        os.path.dirname(os.path.abspath(__file__)),  # Папка самого бота (корень проекта)
+        os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."),
+        os.path.dirname(os.path.abspath(__file__)),
         os.path.join(os.path.expanduser("~"), "Desktop"),
         "C:\\",
         "D:\\",
@@ -132,12 +133,21 @@ def _find_zapret_dir():
 
 
 def _is_zapret_folder(path):
-    """Проверяет что папка действительно Zapret — по ключевым файлам внутри."""
-    indicators = ["winws.exe", "zapret.bat", "config_by_user.bat",
-                  "winws.cmd", "zapret-setup.bat"]
-    for f in indicators:
-        if os.path.exists(os.path.join(path, f)):
-            return True
+    """Проверяет что папка действительно Zapret — по ключевым признакам."""
+    # Стандартный Zapret: service_install, general, bin/winws.exe
+    if os.path.exists(os.path.join(path, "service_install")):
+        return True
+    if os.path.exists(os.path.join(path, "service")):
+        return True
+    if os.path.exists(os.path.join(path, "bin", "winws.exe")):
+        return True
+    # Модифицированный Zapret: config_by_user.bat, winws.exe в корне
+    if os.path.exists(os.path.join(path, "winws.exe")):
+        return True
+    if os.path.exists(os.path.join(path, "config_by_user.bat")):
+        return True
+    if os.path.exists(os.path.join(path, "zapret.bat")):
+        return True
     return False
 
 
@@ -160,68 +170,89 @@ def start_zapret():
 
     print(f"   [Zapret] 📂 Найден: {zapret_dir}")
 
-    # Пробуем запустить через winws.exe (основной способ)
-    winws = os.path.join(zapret_dir, "winws.exe")
-    if os.path.exists(winws):
+    import subprocess as sp
+    DETACHED = sp.CREATE_NEW_PROCESS_GROUP | 0x00000008  # DETACHED_PROCESS
+
+    # Способ 1: service_install (стандартный Zapret — устанавливает как службу Windows)
+    service_install = os.path.join(zapret_dir, "service_install")
+    if os.path.exists(service_install):
         try:
-            # Запускаем winws.exe с типичными параметрами
-            # Используем Popen чтобы процесс жил после выхода Python
-            import subprocess as sp
-            # Читаем config_by_user.bat чтобы понять параметры
-            config_bat = os.path.join(zapret_dir, "config_by_user.bat")
-            if os.path.exists(config_bat):
-                # Проще: запускаем config_by_user.bat
-                print("   [Zapret] 🚀 Запускаем через config_by_user.bat...")
-                sp.Popen(
-                    ["cmd", "/c", config_bat],
-                    cwd=zapret_dir,
-                    creationflags=sp.CREATE_NEW_PROCESS_GROUP | 0x00000008,  # DETACHED_PROCESS
-                    stdout=sp.DEVNULL, stderr=sp.DEVNULL
-                )
-            else:
-                # Пробуем напрямую winws.exe
-                print("   [Zapret] 🚀 Запускаем winws.exe...")
-                sp.Popen(
-                    [winws],
-                    cwd=zapret_dir,
-                    creationflags=sp.CREATE_NEW_PROCESS_GROUP | 0x00000008,
-                    stdout=sp.DEVNULL, stderr=sp.DEVNULL
-                )
-
-            time.sleep(3)
-
+            print("   [Zapret] 🚀 Запускаем через service_install (служба Windows)...")
+            sp.Popen(
+                ["cmd", "/c", service_install],
+                cwd=zapret_dir,
+                creationflags=DETACHED,
+                stdout=sp.DEVNULL, stderr=sp.DEVNULL
+            )
+            time.sleep(5)
             if is_zapret_active():
-                print("   [Zapret] ✅ Zapret запущен успешно!")
+                print("   [Zapret] ✅ Zapret запущен как служба!")
                 return True
             else:
-                print("   [Zapret] ⚠️ Zapret не запустился. Нужны права админа!")
-                print("   [Zapret]   Запустите Zapret вручную от имени администратора.")
-                return False
+                print("   [Zapret] ⚠️ service_install не помог. Пробуем дальше...")
         except Exception as e:
-            print(f"   [Zapret] ❌ Ошибка запуска: {e}")
-            return False
+            print(f"   [Zapret] ⚠️ service_install ошибка: {e}")
 
-    # Пробуем через zapret.bat
-    zapret_bat = os.path.join(zapret_dir, "zapret.bat")
-    if os.path.exists(zapret_bat):
+    # Способ 2: config_by_user.bat (модифицированный Zapret)
+    config_bat = os.path.join(zapret_dir, "config_by_user.bat")
+    if os.path.exists(config_bat):
         try:
-            import subprocess as sp
-            print("   [Zapret] 🚀 Запускаем через zapret.bat...")
+            print("   [Zapret] 🚀 Запускаем через config_by_user.bat...")
             sp.Popen(
-                ["cmd", "/c", zapret_bat],
+                ["cmd", "/c", config_bat],
                 cwd=zapret_dir,
-                creationflags=sp.CREATE_NEW_PROCESS_GROUP | 0x00000008,
+                creationflags=DETACHED,
                 stdout=sp.DEVNULL, stderr=sp.DEVNULL
             )
             time.sleep(3)
             if is_zapret_active():
-                print("   [Zapret] ✅ Zapret запущен через bat!")
+                print("   [Zapret] ✅ Zapret запущен через config_by_user.bat!")
+                return True
+        except:
+            pass
+
+    # Способ 3: winws.exe напрямую (нужен профиль — берём general)
+    winws = os.path.join(zapret_dir, "bin", "winws.exe")
+    if not os.path.exists(winws):
+        winws = os.path.join(zapret_dir, "winws.exe")
+    general = os.path.join(zapret_dir, "general")
+    if os.path.exists(winws) and os.path.exists(general):
+        try:
+            print("   [Zapret] 🚀 Запускаем winws.exe --profile general...")
+            sp.Popen(
+                [winws, "--profile", general],
+                cwd=zapret_dir,
+                creationflags=DETACHED,
+                stdout=sp.DEVNULL, stderr=sp.DEVNULL
+            )
+            time.sleep(3)
+            if is_zapret_active():
+                print("   [Zapret] ✅ Zapret запущен через winws.exe!")
+                return True
+        except:
+            pass
+
+    # Способ 4: zapret.bat (запасной)
+    zapret_bat = os.path.join(zapret_dir, "zapret.bat")
+    if os.path.exists(zapret_bat):
+        try:
+            print("   [Zapret] 🚀 Запускаем через zapret.bat...")
+            sp.Popen(
+                ["cmd", "/c", zapret_bat],
+                cwd=zapret_dir,
+                creationflags=DETACHED,
+                stdout=sp.DEVNULL, stderr=sp.DEVNULL
+            )
+            time.sleep(3)
+            if is_zapret_active():
+                print("   [Zapret] ✅ Zapret запущен через zapret.bat!")
                 return True
         except:
             pass
 
     print("   [Zapret] ❌ Не удалось запустить Zapret автоматически.")
-    print("   [Zapret]   Запустите Zapret вручную от имени администратора.")
+    print("   [Zapret]   Нужны права АДМИНИСТРАТОРА! Запустите бота от имени админа.")
+    print("   [Zapret]   Или запустите Zapret вручную: service_install или config_by_user.bat")
     return False
 
 
