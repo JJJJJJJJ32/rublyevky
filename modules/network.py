@@ -45,18 +45,6 @@ _zapret_path = None  # Путь к Zapret (авто-определяется)
 # 0a. Определение и управление Zapret
 # ═══════════════════════════════════════════════════════════════════════
 
-# Возможные пути к Zapret на диске
-_ZAPRET_SEARCH_PATHS = [
-    os.path.join(os.path.expanduser("~"), "Desktop", "zapret"),
-    os.path.join(os.path.expanduser("~"), "Desktop", "Zapret"),
-    r"C:\zapret",
-    r"C:\Zapret",
-    r"D:\zapret",
-    r"D:\Zapret",
-    os.path.join(os.path.expanduser("~"), "zapret"),
-    os.path.join(os.path.expanduser("~"), "Zapret"),
-]
-
 # Имена exe-файлов Zapret (проверяем процесс)
 _ZAPRET_PROCESS_NAMES = ["winws.exe", "zapret.exe"]
 
@@ -83,21 +71,58 @@ def is_zapret_active():
 
 
 def _find_zapret_dir():
-    """Ищет папку Zapret на диске. Возвращает путь или None."""
+    """Ищет папку Zapret на диске. Имя может быть ЛЮБЫМ — главное чтобы внутри был winws.exe.
+    Ищет в: папка проекта, Desktop, C:/, D:/, домашняя папка.
+    Возвращает путь или None."""
     global _zapret_path
     if _zapret_path and os.path.isdir(_zapret_path):
         return _zapret_path
 
-    for path in _ZAPRET_SEARCH_PATHS:
-        if os.path.isdir(path):
-            # Проверяем что в папке есть ключевые файлы
-            if os.path.exists(os.path.join(path, "winws.exe")) or \
-               os.path.exists(os.path.join(path, "zapret.bat")) or \
-               os.path.exists(os.path.join(path, "config_by_user.bat")):
-                _zapret_path = path
-                return path
+    # Сначала проверяем прямые пути (точное имя zapret)
+    direct_paths = [
+        os.path.join(os.path.dirname(os.path.abspath(__file__)), "zapret"),
+        os.path.join(os.path.expanduser("~"), "Desktop", "zapret"),
+        r"C:\zapret",
+        r"D:\zapret",
+        os.path.join(os.path.expanduser("~"), "zapret"),
+    ]
+
+    for path in direct_paths:
+        if os.path.isdir(path) and _is_zapret_folder(path):
+            _zapret_path = path
+            return path
+
+    # Потом ищем ЛЮБУЮ папку содержащую "zapret" в имени
+    search_roots = [
+        os.path.dirname(os.path.abspath(__file__)),  # Папка самого бота (корень проекта)
+        os.path.join(os.path.expanduser("~"), "Desktop"),
+        "C:\\",
+        "D:\\",
+        os.path.expanduser("~"),
+    ]
+
+    for root in search_roots:
+        try:
+            for name in os.listdir(root):
+                full = os.path.join(root, name)
+                if os.path.isdir(full) and "zapret" in name.lower():
+                    if _is_zapret_folder(full):
+                        _zapret_path = full
+                        return full
+        except (PermissionError, FileNotFoundError):
+            pass
 
     return None
+
+
+def _is_zapret_folder(path):
+    """Проверяет что папка действительно Zapret — по ключевым файлам внутри."""
+    indicators = ["winws.exe", "zapret.bat", "config_by_user.bat",
+                  "winws.cmd", "zapret-setup.bat"]
+    for f in indicators:
+        if os.path.exists(os.path.join(path, f)):
+            return True
+    return False
 
 
 def start_zapret():
