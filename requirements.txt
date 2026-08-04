@@ -1,9 +1,22 @@
+# Сетевые запросы
 requests
+
+# HTML-парсинг
 beautifulsoup4
+
+# Google Drive API
 google-api-python-client
 google-auth-httplib2
 google-auth-oauthlib
+
+# Переменные окружения (.env)
 python-dotenv
-schedule
+
+# ИИ — генерация гайдов и переводов
 g4f
+
+# Транслитерация названий файлов
 python-slugify
+
+# Тестирование
+pytest
