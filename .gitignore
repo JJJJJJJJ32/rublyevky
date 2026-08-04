@@ -15,3 +15,10 @@ __pycache__/
 data/processed_games.json
 data/bot_log.json
 data/products_links.json
+
+# Виртуальное окружение Python (НИКОГДА не коммитить)
+.venv/
+
+# Кэш
+__pycache__/
+.pytest_cache/
