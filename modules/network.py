@@ -569,7 +569,17 @@ def test_funpay_connectivity(session):
     except Exception as e:
         err_str = str(e)
         if "10013" in err_str:
-            print(f"   [Сеть] ❌ WinError 10013 — WARP конфликтует с DirectSession")
+            print(f"   [Сеть] ⚠️ WinError 10013 — WinDivert/Zapret конфликтует с DirectSession")
+            print(f"   [Сеть]   Это нормально при работающем Zapret. Пробуем через обычную сессию...")
+            # Fallback: обычная сессия без source_address (работает через WARP+Zapret)
+            try:
+                fallback = requests.Session()
+                resp = fallback.get("https://funpay.com/", timeout=15)
+                if resp.status_code == 200 and "funpay" in resp.text.lower():
+                    print("   [Сеть] ✅ FunPay доступен через fallback-сессию!")
+                    return True
+            except:
+                pass
         elif "timed out" in err_str.lower() or "ConnectTimeout" in err_str:
             print(f"   [Сеть] ❌ FunPay таймаут — WARP/маршруты не работают")
         elif "UNEXPECTED_EOF" in err_str:
@@ -640,9 +650,10 @@ def heal_network():
     
     print("   [Сеть] ❌ Не удалось починить сеть автоматически.")
     print("   [Сеть]   Попробуйте вручную:")
-    print("   [Сеть]   1. Откройте WARP → нажмите «Отключить» → «Подключить»")
-    print("   [Сеть]   2. В командной строке: route delete 5.254.85.152")
-    print("   [Сеть]   3. В командной строке: route delete 185.104.210.59")
+    print("   [Сеть]   1. Убедитесь что Zapret ЗАПУЩЕН (нужен для WARP!)")
+    print("   [Сеть]   2. Откройте WARP → нажмите «Отключить» → «Подключить»")
+    print("   [Сеть]   3. В командной строке (админ): route delete 5.254.85.152")
+    print("   [Сеть]   4. В командной строке (админ): route delete 185.104.210.59")
     return new_session, False
 
 
@@ -668,8 +679,9 @@ def setup_network():
             print("   [Сеть] ⚠️ WARP запущен но НЕ подключён. Переподключаем...")
             warp_cli_reconnect()
         
-        print("   [Сеть] ⚠️ ВАЖНО: Zapret должен быть ЗАКРЫТ перед запуском бота!")
-        print("   [Сеть]   (Zapret's WinDivert блокирует Python сокеты)")
+        print("   [Сеть] ⚠️ ВАЖНО: Zapret должен быть ЗАПУЩЕН для работы WARP!")
+        print("   [Сеть]   (WARP не может подключиться без Zapret — РКН блокирует Cloudflare)")
+        print("   [Сеть]   Если WinError 10013 — бот автоматически переключится на WARP-сессию")
         
         vpn_session = make_warp_session()
         if test_funpay_connectivity(vpn_session):
