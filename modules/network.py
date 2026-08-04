@@ -37,6 +37,151 @@ _local_gw_cache = None
 _local_iface_cache = None
 _added_routes = []
 _warp_detected = False
+_zapret_detected = False
+_zapret_path = None  # Путь к Zapret (авто-определяется)
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# 0a. Определение и управление Zapret
+# ═══════════════════════════════════════════════════════════════════════
+
+# Возможные пути к Zapret на диске
+_ZAPRET_SEARCH_PATHS = [
+    os.path.join(os.path.expanduser("~"), "Desktop", "zapret"),
+    os.path.join(os.path.expanduser("~"), "Desktop", "Zapret"),
+    r"C:\zapret",
+    r"C:\Zapret",
+    r"D:\zapret",
+    r"D:\Zapret",
+    os.path.join(os.path.expanduser("~"), "zapret"),
+    os.path.join(os.path.expanduser("~"), "Zapret"),
+]
+
+# Имена exe-файлов Zapret (проверяем процесс)
+_ZAPRET_PROCESS_NAMES = ["winws.exe", "zapret.exe"]
+
+
+def is_zapret_active():
+    """Проверяет, запущен ли Zapret (процесс winws.exe)."""
+    global _zapret_detected
+    if _zapret_detected:
+        return True
+
+    if sys.platform == "win32":
+        try:
+            result = _run(
+                ["tasklist", "/FI", "IMAGENAME eq winws.exe"],
+                timeout=5
+            )
+            if "winws" in result.stdout:
+                _zapret_detected = True
+                return True
+        except:
+            pass
+
+    return False
+
+
+def _find_zapret_dir():
+    """Ищет папку Zapret на диске. Возвращает путь или None."""
+    global _zapret_path
+    if _zapret_path and os.path.isdir(_zapret_path):
+        return _zapret_path
+
+    for path in _ZAPRET_SEARCH_PATHS:
+        if os.path.isdir(path):
+            # Проверяем что в папке есть ключевые файлы
+            if os.path.exists(os.path.join(path, "winws.exe")) or \
+               os.path.exists(os.path.join(path, "zapret.bat")) or \
+               os.path.exists(os.path.join(path, "config_by_user.bat")):
+                _zapret_path = path
+                return path
+
+    return None
+
+
+def start_zapret():
+    """Запускает Zapret если он не запущен. Возвращает True если успешно."""
+    if is_zapret_active():
+        print("   [Zapret] ✅ Zapret уже запущен!")
+        return True
+
+    if sys.platform != "win32":
+        print("   [Zapret] ⚠️ Zapret доступен только на Windows.")
+        return False
+
+    zapret_dir = _find_zapret_dir()
+    if not zapret_dir:
+        print("   [Zapret] ⚠️ Папка Zapret не найдена на диске.")
+        print("   [Zapret]   Искали в: Desktop/zapret, C:/zapret, D:/zapret")
+        print("   [Zapret]   Скачайте Zapret и положите в одну из этих папок.")
+        return False
+
+    print(f"   [Zapret] 📂 Найден: {zapret_dir}")
+
+    # Пробуем запустить через winws.exe (основной способ)
+    winws = os.path.join(zapret_dir, "winws.exe")
+    if os.path.exists(winws):
+        try:
+            # Запускаем winws.exe с типичными параметрами
+            # Используем Popen чтобы процесс жил после выхода Python
+            import subprocess as sp
+            # Читаем config_by_user.bat чтобы понять параметры
+            config_bat = os.path.join(zapret_dir, "config_by_user.bat")
+            if os.path.exists(config_bat):
+                # Проще: запускаем config_by_user.bat
+                print("   [Zapret] 🚀 Запускаем через config_by_user.bat...")
+                sp.Popen(
+                    ["cmd", "/c", config_bat],
+                    cwd=zapret_dir,
+                    creationflags=sp.CREATE_NEW_PROCESS_GROUP | 0x00000008,  # DETACHED_PROCESS
+                    stdout=sp.DEVNULL, stderr=sp.DEVNULL
+                )
+            else:
+                # Пробуем напрямую winws.exe
+                print("   [Zapret] 🚀 Запускаем winws.exe...")
+                sp.Popen(
+                    [winws],
+                    cwd=zapret_dir,
+                    creationflags=sp.CREATE_NEW_PROCESS_GROUP | 0x00000008,
+                    stdout=sp.DEVNULL, stderr=sp.DEVNULL
+                )
+
+            time.sleep(3)
+
+            if is_zapret_active():
+                print("   [Zapret] ✅ Zapret запущен успешно!")
+                return True
+            else:
+                print("   [Zapret] ⚠️ Zapret не запустился. Нужны права админа!")
+                print("   [Zapret]   Запустите Zapret вручную от имени администратора.")
+                return False
+        except Exception as e:
+            print(f"   [Zapret] ❌ Ошибка запуска: {e}")
+            return False
+
+    # Пробуем через zapret.bat
+    zapret_bat = os.path.join(zapret_dir, "zapret.bat")
+    if os.path.exists(zapret_bat):
+        try:
+            import subprocess as sp
+            print("   [Zapret] 🚀 Запускаем через zapret.bat...")
+            sp.Popen(
+                ["cmd", "/c", zapret_bat],
+                cwd=zapret_dir,
+                creationflags=sp.CREATE_NEW_PROCESS_GROUP | 0x00000008,
+                stdout=sp.DEVNULL, stderr=sp.DEVNULL
+            )
+            time.sleep(3)
+            if is_zapret_active():
+                print("   [Zapret] ✅ Zapret запущен через bat!")
+                return True
+        except:
+            pass
+
+    print("   [Zapret] ❌ Не удалось запустить Zapret автоматически.")
+    print("   [Zapret]   Запустите Zapret вручную от имени администратора.")
+    return False
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -589,6 +734,11 @@ def heal_network():
     """
     print("   [Сеть] 🔧 АВТО-ПОЧИНКА СЕТИ...")
     
+    # Шаг 0: Убедимся что Zapret работает (нужен для WARP)
+    if not is_zapret_active():
+        print("   [Сеть] ⚠️ Zapret не запущен! Пробуем запустить...")
+        start_zapret()
+    
     # Шаг 1: Удаляем ВСЕ маршруты к FunPay — они конфликтуют с WARP
     cleanup_all_funpay_routes()
     time.sleep(2)
@@ -655,6 +805,13 @@ def setup_network():
     if warp_on:
         print("   [Сеть] ☁️ Обнаружен Cloudflare WARP!")
         
+        # Zapret нужен для WARP — пробуем запустить если не работает
+        if not is_zapret_active():
+            print("   [Сеть] ⚠️ Zapret не запущен! Пробуем запустить автоматически...")
+            start_zapret()
+        else:
+            print("   [Сеть] ✅ Zapret запущен — WARP будет стабильно работать!")
+        
         # Удаляем старые маршруты от предыдущих запусков (они конфликтуют с WARP!)
         cleanup_all_funpay_routes()
         
@@ -663,9 +820,9 @@ def setup_network():
             print("   [Сеть] ⚠️ WARP запущен но НЕ подключён. Переподключаем...")
             warp_cli_reconnect()
         
-        print("   [Сеть] ⚠️ ВАЖНО: Zapret должен быть ЗАПУЩЕН для работы WARP!")
-        print("   [Сеть]   (WARP не может подключиться без Zapret — РКН блокирует Cloudflare)")
-        print("   [Сеть]   Если WinError 10013 — бот автоматически переключится на WARP-сессию")
+        print("   [Сеть] ⚠️ ВАЖНО: Zapret нужен для стабильной работы WARP!")
+        print("   [Сеть]   (Без Zapret WARP не может перезапуститься — РКН блокирует)")
+        print("   [Сеть]   Бот попытался запустить Zapret автоматически.")
         
         vpn_session = make_warp_session()
         if test_funpay_connectivity(vpn_session):

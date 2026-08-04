@@ -190,8 +190,8 @@ def main():
     
     # Подсказка про WARP
     if is_warp_active():
-        print("   [Сеть] ☁️ WARP обнаружен. Zapret должен быть ЗАПУЩЕН для стабильности WARP!")
-        print("   [Сеть]   (Без Zapret WARP не может перезапуститься при обрыве)")
+        print("   [Сеть] ☁️ WARP обнаружен. Zapret нужен для стабильности — бот запустит его сам!")
+        print("   [Сеть]   (Положите Zapret в Desktop/zapret или C:/zapret)")
     
     while True:
         try:
