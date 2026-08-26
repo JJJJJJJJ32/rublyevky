@@ -2,11 +2,9 @@ import time
 import random
 import os
 import atexit
-from datetime import datetime
 from slugify import slugify
 
 import config
-from modules.logger import logger
 from modules.games_list_reader import load_games_list, remove_game_from_list
 from modules.wemod_checker import check_wemod_availability
 from modules.ai_generator import ai_generate_product_ideas, ai_generate_full_content
@@ -20,8 +18,7 @@ from modules.description_builder import (
 )
 from modules.funpay_auth import get_session
 from modules.network import (
-    setup_network, remove_funpay_routes, make_warp_session, 
-    is_warp_active, heal_network, cleanup_all_funpay_routes
+    setup_network, remove_funpay_routes, is_warp_active, heal_network
 )
 from modules.lot_publisher import publish_lot, get_category_info
 from modules.duplicate_checker import is_game_processed, mark_as_processed
@@ -84,109 +81,155 @@ def _publish_with_heal(session, net_session, game_id, short, full, pay_msg, pric
     result = publish_lot(session, {"game_id": game_id}, short, full, pay_msg, price)
     return result, session, net_session
 
+def _complete_game(game_id, game_name):
+    """Фиксирует игру только после действительно завершённой обработки."""
+    mark_as_processed(game_id)
+    remove_game_from_list(game_name)
+
+
 def process_single_game(session, game_data, net_session):
     game_name = game_data['game_name']
-    found = find_funpay_category(session, game_name)
+    configured_id = str(game_data.get('game_id') or '').strip()
+
+    # Если ID указан в games_list.txt, используем его и не зависим от поиска.
+    found = find_funpay_category(session, game_name, known_id=configured_id or None)
     if not found:
-        print(f"   [!] Игра '{game_name}' не найдена. Пропуск.")
-        remove_game_from_list(game_name); return session, net_session
-    
+        # Не удаляем игру: это может быть временная ошибка сети или HTML FunPay.
+        print(f"   [!] Игра '{game_name}' не найдена. Оставляем в списке для повтора.")
+        return session, net_session
+
     game_id = found['id']
     if is_game_processed(game_id):
-        remove_game_from_list(game_name); return session, net_session
+        _complete_game(game_id, game_name)
+        return session, net_session
 
     print(f"\n🌍 РАЗДЕЛ: {get_category_info(session, game_id)} ({found['type']})")
     print(f"📊 ИГРА: {game_name.upper()}")
 
-    # 15 товаров: 3 ваших + 12 от ИИ
+    # До 15 товаров: 3 обязательных + до 12 идей от ИИ.
     ai_ideas = ai_generate_product_ideas(game_name) or []
     final_ideas = MANDATORY_PRODUCTS + ai_ideas[:12]
 
     try:
         folder_id = gdrive.create_folder(f"{game_name}_products")
-        if not folder_id: return session, net_session
+        if not folder_id:
+            print("   [!] Папка Google Drive не создана. Игра останется в списке.")
+            return session, net_session
 
         fail_count = 0
+        published_count = 0
+        all_products_finished = True
+
         for i, idea in enumerate(final_ideas):
             print(f"📦 [{game_name}] {i+1}/{len(final_ideas)}: {idea['title']}")
-            
-            content = ai_generate_full_content(idea, game_name)
-            if not content:
-                print(f"      ⚠️ Гайд не сгенерирован. Пропускаем товар.")
-                continue
-            file_name = f"{slugify(idea['title'][:30])}_{random.randint(100,999)}.txt"
-            file_path = f"generated_content/{file_name}"
-            os.makedirs("generated_content", exist_ok=True)
-            with open(file_path, "w", encoding="utf-8") as f: f.write(content)
-            
-            link = gdrive.upload_file(file_path, folder_id)
-            short = generate_short_description_ruble(idea['title'])
-            full = generate_full_description_ruble(idea, game_name)
-            pay_msg = generate_payment_message(link)
-            
-            # Публикуем с авто-починкой — бот НЕ пропускает игру при обрывах!
-            result, session, net_session = _publish_with_heal(
-                session, net_session, game_id, short, full, pay_msg, 1
-            )
-            
-            if result == "cloudflare_banned":
-                print(f"   [🚫] Cloudflare заблокировал IP. Пауза {config.CLOUDFLARE_PAUSE // 60} мин...")
-                time.sleep(config.CLOUDFLARE_PAUSE)
-                session = get_session(network_session=net_session, fresh=True)
-                if not session:
-                    time.sleep(300); return session, net_session
-                continue
-            if result == "limit_reached":
-                print(f"   [!] Лимит лотов исчерпан. Переходим к следующей игре.")
-                mark_as_processed(game_id)
-                remove_game_from_list(game_name)
-                return session, net_session
-            
-            # Короткий английский текст — не считается неудачей
-            if result == "too_short_en":
-                print(f"      ⚠️ Английский текст слишком короткий. Пропускаем товар.")
-                continue
-            
-            # Длинный русский текст — не считается неудачей
-            if result == "too_long_ru":
-                print(f"      ⚠️ Русский текст слишком длинный. Пропускаем товар.")
-                continue
-            
-            # Считаем подряд неудачные публикации БЕЗ конкретной ошибки
-            if result in ("no_csrf", None):
-                fail_count += 1
-                if fail_count >= 3:
-                    print(f"   [!] 3 неудачи подряд без ответа. Переходим к следующей игре.")
-                    mark_as_processed(game_id)
-                    remove_game_from_list(game_name)
+            file_path = None
+            try:
+                content = ai_generate_full_content(idea, game_name)
+                if not content:
+                    print("      ⚠️ Гайд не сгенерирован. Игра останется для повтора.")
+                    all_products_finished = False
+                    continue
+
+                file_name = f"{slugify(idea['title'][:30])}_{random.randint(100,999)}.txt"
+                file_path = os.path.join("generated_content", file_name)
+                os.makedirs("generated_content", exist_ok=True)
+                with open(file_path, "w", encoding="utf-8") as f:
+                    f.write(content)
+
+                link = gdrive.upload_file(file_path, folder_id)
+                if not link or str(link).endswith("/error"):
+                    print("      ⚠️ Файл не загружен в Google Drive. Игра останется для повтора.")
+                    all_products_finished = False
+                    continue
+
+                short = generate_short_description_ruble(idea['title'])
+                full = generate_full_description_ruble(idea, game_name)
+                pay_msg = generate_payment_message(link)
+
+                result, session, net_session = _publish_with_heal(
+                    session, net_session, game_id, short, full, pay_msg, 1
+                )
+
+                if result == "cloudflare_banned":
+                    print(f"   [🚫] Cloudflare заблокировал IP. Пауза {config.CLOUDFLARE_PAUSE // 60} мин...")
+                    time.sleep(config.CLOUDFLARE_PAUSE)
+                    session = get_session(network_session=net_session, fresh=True)
+                    all_products_finished = False
+                    if not session:
+                        print("   [!] Авторизацию восстановить не удалось. Игра останется в списке.")
+                        return session, net_session
+                    continue
+
+                if result == "limit_reached":
+                    print("   [!] Лимит лотов исчерпан. Переходим к следующей игре.")
+                    _complete_game(game_id, game_name)
                     return session, net_session
-            else:
-                fail_count = 0
-            
-            if os.path.exists(file_path): os.remove(file_path)
-            time.sleep(random.randint(7, 15))
+
+                if result == "too_short_en":
+                    print("      ⚠️ Английский текст слишком короткий. Товар пропущен.")
+                    all_products_finished = False
+                    continue
+
+                if result == "too_long_ru":
+                    print("      ⚠️ Русский текст слишком длинный. Товар пропущен.")
+                    all_products_finished = False
+                    continue
+
+                if result == "network_error":
+                    print("   [!] Сеть не восстановилась. Игра останется в списке для повтора.")
+                    all_products_finished = False
+                    return session, net_session
+
+                if result in ("no_csrf", None):
+                    fail_count += 1
+                    all_products_finished = False
+                    if fail_count >= 3:
+                        print("   [!] Три неудачи подряд. Игра останется в списке для повтора.")
+                        return session, net_session
+                elif result == "success":
+                    published_count += 1
+                    fail_count = 0
+                else:
+                    all_products_finished = False
+                    print(f"      ⚠️ Неизвестный результат публикации: {result}")
+                    continue
+
+                time.sleep(random.randint(7, 15))
+            finally:
+                # Временный файл удаляем даже при исключении или сетевом сбое.
+                if file_path and os.path.exists(file_path):
+                    os.remove(file_path)
 
         if check_wemod_availability(game_name):
-            print(f"💎 СОЗДАНИЕ WEMOD...")
+            print("💎 СОЗДАНИЕ WEMOD...")
             wemod_result, session, net_session = _publish_with_heal(
                 session, net_session, game_id,
                 generate_short_description_wemod(game_name),
                 generate_full_description_wemod(game_name),
                 generate_payment_message(config.WEMOD_FIXED_LINK), 60
             )
+            if wemod_result == "success":
+                published_count += 1
+            else:
+                all_products_finished = False
+                print(f"   [!] WeMod-лот не опубликован: {wemod_result}. Игра останется в списке.")
 
-        mark_as_processed(game_id)
-        remove_game_from_list(game_name)
-        print(f"✨ {game_name} Готово.")
+        if published_count > 0 and all_products_finished:
+            _complete_game(game_id, game_name)
+            print(f"✨ {game_name} Готово.")
+        else:
+            print(f"   [!] {game_name} обработана не полностью. Оставляем её в списке.")
     except Exception as e:
-        print(f"   [!] Ошибка в игре: {e}")
-        remove_game_from_list(game_name)
-    
+        # Ошибки не должны безвозвратно удалять игру из очереди.
+        print(f"   [!] Ошибка в игре: {e}. Игра останется в списке.")
+
     return session, net_session
 
 def main():
-    print("=== FUNPAY FINAL-STABLE BOT v18.0 STARTED ===\n")
+    print("=== FUNPAY FINAL-STABLE BOT v18.7 STARTED ===\n")
     net_session, net_ok = setup_network()
+    if not net_ok:
+        print("   [Сеть] ⚠️ Проверка сети не пройдена. Бот будет повторять попытки без удаления игр.")
     
     # Подсказка про WARP
     if is_warp_active():

@@ -24,6 +24,23 @@ import requests
 import os
 import time
 
+
+# ─── Безопасный запуск системных команд ────────────────────────────────
+def _run(cmd, timeout=10, **kwargs):
+    """Запускает системную команду и безопасно читает её вывод на Windows.
+
+    route, ipconfig и tasklist на русской Windows обычно используют OEM
+    (cp866), а не UTF-8. errors='replace' не даёт проблемной кодировке
+    сломать проверку сети.
+    """
+    kwargs.setdefault("capture_output", True)
+    kwargs.setdefault("text", True)
+    kwargs.setdefault("timeout", timeout)
+    kwargs.setdefault("encoding", "oem" if sys.platform == "win32" else "utf-8")
+    kwargs.setdefault("errors", "replace")
+    return subprocess.run(cmd, **kwargs)
+
+
 # ─── Домены FunPay для маршрутизации ───────────────────────────────────
 FUNPAY_DOMAINS = [
     "funpay.com",
@@ -36,8 +53,6 @@ _local_ip_cache = None
 _local_gw_cache = None
 _local_iface_cache = None
 _added_routes = []
-_warp_detected = False
-_zapret_detected = False
 _zapret_path = None  # Путь к Zapret (авто-определяется)
 
 
@@ -50,22 +65,24 @@ _ZAPRET_PROCESS_NAMES = ["winws.exe", "zapret.exe"]
 
 
 def is_zapret_active():
-    """Проверяет, запущен ли Zapret (процесс winws.exe)."""
-    global _zapret_detected
-    if _zapret_detected:
-        return True
+    """Проверяет, запущен ли Zapret (winws.exe или zapret.exe).
 
-    if sys.platform == "win32":
+    Состояние не кэшируем: Zapret может быть остановлен после предыдущей
+    проверки, и бот должен это заметить.
+    """
+    if sys.platform != "win32":
+        return False
+
+    for process_name in _ZAPRET_PROCESS_NAMES:
         try:
             result = _run(
-                ["tasklist", "/FI", "IMAGENAME eq winws.exe"],
-                timeout=5
+                ["tasklist", "/FI", f"IMAGENAME eq {process_name}"],
+                timeout=5,
             )
-            if "winws" in result.stdout:
-                _zapret_detected = True
+            if process_name.lower() in result.stdout.lower():
                 return True
-        except:
-            pass
+        except (OSError, subprocess.SubprocessError):
+            continue
 
     return False
 
@@ -245,63 +262,50 @@ def start_zapret():
 # ═══════════════════════════════════════════════════════════════════════
 
 def is_warp_active():
-    """Проверяет, запущен ли Cloudflare WARP (процесс)."""
-    global _warp_detected
-    if _warp_detected:
-        return True
-    
+    """Проверяет, запущен ли процесс Cloudflare WARP.
+
+    Проверяем каждый раз, чтобы после отключения WARP не оставалось старого
+    значения из кэша.
+    """
     if sys.platform == "win32":
-        try:
-            result = subprocess.run(
-                ["tasklist", "/FI", "IMAGENAME eq WarpClient.exe"],
-                capture_output=True, text=True, timeout=5
-            )
-            if "WarpClient" in result.stdout:
-                _warp_detected = True
-                return True
-            # Альтернативное имя процесса
-            result2 = subprocess.run(
-                ["tasklist", "/FI", "IMAGENAME eq Cloudflare WARP.exe"],
-                capture_output=True, text=True, timeout=5
-            )
-            if "Cloudflare" in result2.stdout:
-                _warp_detected = True
-                return True
-        except:
-            pass
+        for process_name in ("WarpClient.exe", "Cloudflare WARP.exe"):
+            try:
+                result = _run(
+                    ["tasklist", "/FI", f"IMAGENAME eq {process_name}"],
+                    timeout=5,
+                )
+                if process_name.lower() in result.stdout.lower():
+                    return True
+            except (OSError, subprocess.SubprocessError):
+                continue
     else:
         try:
-            result = subprocess.run(
-                ["pgrep", "-f", "warp-svc"],
-                capture_output=True, text=True, timeout=5
-            )
+            result = _run(["pgrep", "-f", "warp-svc"], timeout=5)
             if result.returncode == 0:
-                _warp_detected = True
                 return True
-        except:
+        except (OSError, subprocess.SubprocessError):
             pass
-    
+
     return False
 
 
 def warp_cli_status():
-    """Проверяет статус WARP через warp-cli. Возвращает True если подключён."""
+    """Проверяет статус WARP через warp-cli.
+
+    Нельзя просто проверять ``"connected" in output``: слово
+    ``disconnected`` тоже содержит эту последовательность.
+    """
     if sys.platform != "win32":
         return False
     try:
-        result = subprocess.run(
-            ["warp-cli", "status"],
-            capture_output=True, text=True, timeout=10
-        )
+        result = _run(["warp-cli", "status"], timeout=10)
         output = result.stdout.lower()
-        # "Status: Connected" или "Status: Connect" (в процессе)
-        if "connected" in output:
-            return True
-        # "Status: Registration Missing" — нужно перерегистрировать
-        if "registration missing" in output or "registration missing" in output:
-            return False
-        return False
-    except Exception:
+        status_lines = [line for line in output.splitlines() if "status" in line]
+        status = " ".join(status_lines) if status_lines else output
+        return bool(re.search(r"\bconnected\b", status)) and not bool(
+            re.search(r"\bdisconnected\b", status)
+        )
+    except (OSError, subprocess.SubprocessError):
         return False
 
 
@@ -314,11 +318,11 @@ def warp_cli_reconnect():
     
     try:
         # Шаг 1: Отключаем
-        subprocess.run(["warp-cli", "disconnect"], capture_output=True, text=True, timeout=10)
+        _run(["warp-cli", "disconnect"], capture_output=True, text=True, timeout=10)
         time.sleep(3)
         
         # Шаг 2: Подключаем
-        result = subprocess.run(["warp-cli", "connect"], capture_output=True, text=True, timeout=15)
+        _run(["warp-cli", "connect"], capture_output=True, text=True, timeout=15)
         time.sleep(5)
         
         # Шаг 3: Проверяем статус
@@ -337,15 +341,15 @@ def _warp_full_reregister():
     """Полная перерегистрация WARP: delete → new → MASQUE → connect."""
     print("   [WARP] 🔧 Полная перерегистрация WARP...")
     try:
-        subprocess.run(["warp-cli", "registration", "delete"], capture_output=True, text=True, timeout=10)
+        _run(["warp-cli", "registration", "delete"], capture_output=True, text=True, timeout=10)
         time.sleep(2)
-        subprocess.run(["warp-cli", "registration", "new"], capture_output=True, text=True, timeout=10)
+        _run(["warp-cli", "registration", "new"], capture_output=True, text=True, timeout=10)
         time.sleep(2)
-        subprocess.run(["warp-cli", "tunnel", "protocol", "set", "MASQUE"], capture_output=True, text=True, timeout=10)
+        _run(["warp-cli", "tunnel", "protocol", "set", "MASQUE"], capture_output=True, text=True, timeout=10)
         time.sleep(1)
-        subprocess.run(["warp-cli", "tunnel", "masque-options", "set", "h2-only"], capture_output=True, text=True, timeout=10)
+        _run(["warp-cli", "tunnel", "masque-options", "set", "h2-only"], capture_output=True, text=True, timeout=10)
         time.sleep(2)
-        subprocess.run(["warp-cli", "connect"], capture_output=True, text=True, timeout=15)
+        _run(["warp-cli", "connect"], capture_output=True, text=True, timeout=15)
         time.sleep(5)
         
         if warp_cli_status():
@@ -378,7 +382,6 @@ def detect_local_interface():
     Возвращает (ip, gateway, interface) или (None, None, None).
     Результат кэшируется.
     """
-    global _local_ip_cache, _local_gw_cache, _local_iface_cache
     if _local_ip_cache:
         return _local_ip_cache, _local_gw_cache, _local_iface_cache
 
@@ -394,7 +397,7 @@ def _detect_linux():
     global _local_ip_cache, _local_gw_cache, _local_iface_cache
 
     try:
-        result = subprocess.run(
+        result = _run(
             ["ip", "route", "show", "default"],
             capture_output=True, text=True, timeout=10
         )
@@ -419,7 +422,7 @@ def _detect_linux():
 
         # IP-адрес интерфейса
         if _local_iface_cache:
-            result = subprocess.run(
+            result = _run(
                 ["ip", "addr", "show", "dev", _local_iface_cache],
                 capture_output=True, text=True, timeout=10
             )
@@ -436,7 +439,7 @@ def _detect_windows():
     global _local_ip_cache, _local_gw_cache, _local_iface_cache
 
     try:
-        result = subprocess.run(
+        result = _run(
             ["ipconfig", "/all"],
             capture_output=True, text=True, timeout=10
         )
@@ -530,8 +533,6 @@ def add_funpay_routes():
     Требует root/admin привилегий.
     Возвращает True, если хотя бы один маршрут добавлен.
     """
-    global _added_routes
-
     # WARP активен — маршруты НЕ добавляем, они конфликтуют!
     if is_warp_active():
         print("   [Сеть] ☁️ WARP активен — маршруты НЕ добавляем (конфликтуют с WARP)")
@@ -551,7 +552,7 @@ def add_funpay_routes():
     for fp_ip in funpay_ips:
         try:
             if sys.platform == "win32":
-                result = subprocess.run(
+                result = _run(
                     ["route", "add", fp_ip, "mask", "255.255.255.255", gw],
                     capture_output=True, text=True, timeout=10
                 )
@@ -562,7 +563,7 @@ def add_funpay_routes():
                 cmd = ["ip", "route", "add", f"{fp_ip}/32", "via", gw]
                 if iface:
                     cmd += ["dev", iface]
-                result = subprocess.run(
+                result = _run(
                     cmd, capture_output=True, text=True, timeout=10
                 )
                 if result.returncode == 0 or "File exists" in result.stderr:
@@ -586,11 +587,11 @@ def _add_policy_route(source_ip, gateway, interface):
     """На Linux добавляет policy routing для исходящего IP."""
     try:
         table_id = "100"
-        subprocess.run(
+        _run(
             ["ip", "rule", "add", "from", source_ip, "table", table_id],
             capture_output=True, text=True, timeout=10
         )
-        subprocess.run(
+        _run(
             ["ip", "route", "add", "default", "via", gateway, "dev", interface, "table", table_id],
             capture_output=True, text=True, timeout=10
         )
@@ -605,12 +606,12 @@ def remove_funpay_routes():
     for fp_ip in _added_routes:
         try:
             if sys.platform == "win32":
-                subprocess.run(
+                _run(
                     ["route", "delete", fp_ip],
                     capture_output=True, text=True, timeout=10
                 )
             else:
-                subprocess.run(
+                _run(
                     ["ip", "route", "del", f"{fp_ip}/32"],
                     capture_output=True, text=True, timeout=10
                 )
@@ -638,7 +639,7 @@ def cleanup_all_funpay_routes():
     if sys.platform == "win32":
         # На Windows: сканируем таблицу маршрутов и удаляем все к FunPay IP
         try:
-            result = subprocess.run(
+            result = _run(
                 ["route", "print"],
                 capture_output=True, text=True, timeout=10
             )
@@ -647,7 +648,7 @@ def cleanup_all_funpay_routes():
                 for fp_ip in funpay_ips:
                     if fp_ip in line:
                         try:
-                            subprocess.run(
+                            _run(
                                 ["route", "delete", fp_ip],
                                 capture_output=True, text=True, timeout=10
                             )
@@ -660,7 +661,7 @@ def cleanup_all_funpay_routes():
     else:
         for fp_ip in funpay_ips:
             try:
-                result = subprocess.run(
+                result = _run(
                     ["ip", "route", "del", f"{fp_ip}/32"],
                     capture_output=True, text=True, timeout=10
                 )
@@ -754,8 +755,8 @@ def test_funpay_connectivity(session):
     except Exception as e:
         err_str = str(e)
         if "10013" in err_str:
-            print(f"   [Сеть] ⚠️ WinError 10013 — WinDivert/Zapret конфликтует с DirectSession")
-            print(f"   [Сеть]   Это нормально при работающем Zapret. Пробуем через обычную сессию...")
+            print("   [Сеть] ⚠️ WinError 10013 — WinDivert/Zapret конфликтует с DirectSession")
+            print("   [Сеть]   Это нормально при работающем Zapret. Пробуем через обычную сессию...")
             # Fallback: обычная сессия без source_address (работает через WARP+Zapret)
             try:
                 fallback = requests.Session()
@@ -766,9 +767,9 @@ def test_funpay_connectivity(session):
             except:
                 pass
         elif "timed out" in err_str.lower() or "ConnectTimeout" in err_str:
-            print(f"   [Сеть] ❌ FunPay таймаут — WARP/маршруты не работают")
+            print("   [Сеть] ❌ FunPay таймаут — WARP/маршруты не работают")
         elif "UNEXPECTED_EOF" in err_str:
-            print(f"   [Сеть] ❌ SSL EOF — Cloudflare заблокировал IP")
+            print("   [Сеть] ❌ SSL EOF — Cloudflare заблокировал IP")
         else:
             print(f"   [Сеть] ❌ FunPay недоступен: {e}")
         return False
@@ -812,7 +813,7 @@ def heal_network():
         # На Windows пробуем warp-cli
         if sys.platform == "win32":
             try:
-                subprocess.run(["warp-cli", "connect"], capture_output=True, text=True, timeout=15)
+                _run(["warp-cli", "connect"], capture_output=True, text=True, timeout=15)
                 time.sleep(5)
                 if warp_cli_status():
                     print("   [Сеть] ✅ WARP запущен и подключён!")
@@ -853,7 +854,6 @@ def setup_network():
     Вызывать один раз при старте бота.
     Возвращает (session, success).
     """
-    global _warp_detected
     print("   [Сеть] Настройка маршрутизации FunPay...")
 
     # Проверяем WARP первым делом

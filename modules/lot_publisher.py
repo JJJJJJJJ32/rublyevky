@@ -75,13 +75,7 @@ def _fill_select(payload, name, select_tag):
             non_empty.append((val, text))
 
     if not non_empty:
-        # Все option пустые — берём первый, какой есть
-        for opt in options:
-            val = opt.get('value', '')
-            if val:
-                payload[name] = val
-                return
-        # Вообще ничего нет — ставим пустую строку
+        # Нет реальных вариантов — отправляем пустое значение, не выдумывая ID.
         payload[name] = ''
         return
 
@@ -114,30 +108,52 @@ def publish_lot(session, game_data, short_description, full_description, payment
         s_ru = enforce_limits(short_description, LIMITS['summary_min'], LIMITS['summary_max'], is_en=False, single_line=True, max_bytes=LIMITS['summary_max_bytes'])
         # Английский description: минимум 500 символов
         f_en = enforce_limits(ai_translate_to_en(full_description), LIMITS['description_min_en'], 3000, is_en=True)
-        # Русский description: без изменений
-        f_ru = full_description
+        # Русский description: тоже соблюдаем лимиты FunPay.
+        f_ru = enforce_limits(
+            full_description,
+            LIMITS['description_min_ru'],
+            LIMITS.get('description_max_ru', 3000),
+        )
         # Английский payment_msg: минимум 300 символов
         p_en = enforce_limits(ai_translate_to_en(payment_message), LIMITS.get('payment_msg_min_en', 300), LIMITS['payment_msg_max'], is_en=True)
         
         resp = session.get(edit_url, timeout=25)
-        
+
         # Проверка Cloudflare бана
-        if resp.status_code == 403 or "cf-browser-verification" in resp.text.lower() or "just a moment" in resp.text.lower() or "cloudflare" in resp.text.lower() and len(resp.text) < 5000:
-            print(f"      🚫 Cloudflare заблокировал IP. Требуется пауза.")
+        response_text = resp.text or ""
+        response_lower = response_text.lower()
+        if (
+            resp.status_code == 403
+            or "cf-browser-verification" in response_lower
+            or "just a moment" in response_lower
+            or ("cloudflare" in response_lower and len(response_text) < 5000)
+        ):
+            print("      🚫 Cloudflare заблокировал IP. Требуется пауза.")
             return "cloudflare_banned"
-        
-        soup = BeautifulSoup(resp.text, 'html.parser')
-        
+        if resp.status_code >= 500:
+            print(f"      ❌ FunPay временно недоступен (HTTP {resp.status_code}).")
+            return "network_error"
+        if resp.status_code >= 400:
+            print(f"      ❌ FunPay вернул HTTP {resp.status_code}.")
+            return "no_csrf"
+
+        soup = BeautifulSoup(response_text, 'html.parser')
+
         body = soup.find('body')
         csrf = None
         if body and body.has_attr('data-app-data'):
-            csrf = json.loads(body.get('data-app-data')).get('csrf-token')
+            try:
+                app_data = json.loads(body.get('data-app-data') or '{}')
+                csrf = app_data.get('csrf-token')
+            except (TypeError, ValueError):
+                print("      ⚠️ Не удалось разобрать данные страницы FunPay.")
         if not csrf:
             inp = soup.find('input', {'name': 'csrf_token'})
-            if inp: csrf = inp.get('value')
+            if inp:
+                csrf = inp.get('value')
         
         if not csrf:
-            print(f"      ❌ CSRF не найден — страница формы недоступна")
+            print("      ❌ CSRF не найден — страница формы недоступна")
             return "no_csrf"
 
         payload = {
@@ -167,10 +183,31 @@ def publish_lot(session, game_data, short_description, full_description, payment
             elif 'payment_msg' in low: payload[name] = p_en if '[en]' in low else payment_message
             elif 'quantity' in low or 'amount' in low: payload[name] = "999"
 
-        response = session.post(save_url, data=payload, headers={"X-Requested-With": "XMLHttpRequest", "Referer": edit_url}, timeout=30)
-        result = response.json()
+        response = session.post(
+            save_url,
+            data=payload,
+            headers={"X-Requested-With": "XMLHttpRequest", "Referer": edit_url},
+            timeout=30,
+        )
+        post_text = response.text or ""
+        post_lower = post_text.lower()
+        if (
+            response.status_code == 403
+            or "cf-browser-verification" in post_lower
+            or "just a moment" in post_lower
+            or ("cloudflare" in post_lower and len(post_text) < 5000)
+        ):
+            print("      🚫 Cloudflare заблокировал IP при сохранении.")
+            return "cloudflare_banned"
+        if response.status_code >= 500:
+            return "network_error"
+        try:
+            result = response.json()
+        except ValueError:
+            print(f"      ❌ FunPay вернул не JSON (HTTP {response.status_code}).")
+            return "no_csrf"
         if result.get('done'):
-            print(f"      ✅ УСПЕШНО ВЫСТАВЛЕНО!")
+            print("      ✅ УСПЕШНО ВЫСТАВЛЕНО!")
             return "success"
         else:
             errors = result.get('errors')
@@ -179,7 +216,7 @@ def publish_lot(session, game_data, short_description, full_description, payment
             if errors:
                 err_str = str(errors).lower()
                 if any(kw in err_str for kw in ['много предложений', 'много лотов', 'too many', 'удалите ненужные', 'limit']):
-                    print(f"      ⚠️ Лимит лотов в категории исчерпан — переходим к следующей игре.")
+                    print("      ⚠️ Лимит лотов в категории исчерпан — переходим к следующей игре.")
                     return "limit_reached"
                 # Короткий английский текст — можно попробовать перезаполнить
                 if 'короткого английского' in err_str or 'too short' in err_str:
@@ -188,8 +225,11 @@ def publish_lot(session, game_data, short_description, full_description, payment
                 if 'слишком длинный' in err_str or 'too long' in err_str:
                     return "too_long_ru"
             return None
-    except requests.exceptions.ConnectionError as e:
+    except (requests.exceptions.ConnectionError, requests.exceptions.Timeout) as e:
         print(f"      ❌ ОШИБКА СЕТИ: {e}")
+        return "network_error"
+    except requests.exceptions.RequestException as e:
+        print(f"      ❌ ОШИБКА HTTP: {e}")
         return "network_error"
     except Exception as e:
         print(f"      ❌ ОШИБКА publish_lot: {e}")

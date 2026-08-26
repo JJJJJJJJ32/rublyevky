@@ -1,8 +1,64 @@
 import g4f
 import json
-import time
 import re
-from modules.logger import logger
+
+
+# g4f меняет список доступных моделей и API. Сначала используем новый Client,
+# затем старый ChatCompletion как запасной вариант.
+_g4f_client = None
+_MODELS = [
+    "gemini-2.5-flash",
+    "gemini-2.0-flash",
+    "llama-4-scout",
+    "llama-3.3-70b",
+    "mistral-small-3.1-24b",
+    "hermes-2-dpo",
+]
+
+
+def _get_client():
+    """Создаёт g4f Client один раз, если он есть в установленной версии."""
+    global _g4f_client
+    if _g4f_client is None:
+        try:
+            from g4f.client import Client
+            _g4f_client = Client()
+        except Exception as e:
+            print(f"      [AI] ⚠️ Новый API g4f недоступен: {e}")
+            _g4f_client = False
+    return _g4f_client if _g4f_client is not False else None
+
+
+def _ask_ai(model_name, messages):
+    """Возвращает текст ответа ИИ или None, не скрывая все детали навсегда."""
+    client = _get_client()
+    if client:
+        try:
+            response = client.chat.completions.create(
+                model=model_name,
+                messages=messages,
+            )
+            if response and response.choices:
+                content = response.choices[0].message.content
+                if content and str(content).strip():
+                    return str(content).strip()
+        except Exception as e:
+            print(f"      [AI] Client API ошибка ({model_name}): {str(e)[:120]}")
+
+    try:
+        response = g4f.ChatCompletion.create(
+            model=model_name,
+            messages=messages,
+        )
+        if response:
+            text = response if isinstance(response, str) else str(response)
+            if text.strip():
+                return text.strip()
+    except Exception as e:
+        print(f"      [AI] ChatCompletion ошибка ({model_name}): {str(e)[:120]}")
+
+    return None
+
 
 # Слова-маркеры что ИИ отказался или выдал себя
 _REFUSE_KEYWORDS = [
@@ -59,19 +115,21 @@ def ai_generate_product_ideas(game_name):
   }}
 ]"""
     
-    models = ["gpt-4o", "gpt-4", "gpt-3.5-turbo"]
-    for model_name in models:
+    for model_name in _MODELS:
         try:
             print(f"   [AI] Генерируем русские идеи через {model_name}...")
-            response = g4f.ChatCompletion.create(
-                model=model_name, 
-                messages=[{"role": "user", "content": prompt}]
-            )
+            response = _ask_ai(model_name, [{"role": "user", "content": prompt}])
+            if not response:
+                continue
             match = re.search(r'\[\s*\{.*\}\s*\]', response, re.DOTALL)
             if match:
                 data = json.loads(match.group(0))
-                if len(data) >= 5: return data
-        except: continue
+                if isinstance(data, list) and len(data) >= 5:
+                    return data[:12]
+        except (TypeError, ValueError, json.JSONDecodeError) as e:
+            print(f"   [AI] Ошибка разбора идей ({model_name}): {e}")
+        except Exception as e:
+            print(f"   [AI] Ошибка идей ({model_name}): {e}")
     return []
 
 def ai_generate_full_content(idea, game_name):
@@ -97,17 +155,11 @@ def ai_generate_full_content(idea, game_name):
     # Промпт для дописывания — если гайд короткий, просим продолжить
     prompt_continue = """ПРОДОЛЖИ гайд! Ты написал слишком мало. Напиши ЕЩЁ минимум 400 слов с конкретными советами, примерами и пошаговыми инструкциями. НЕ повторяй то что уже написано. Продолжай с того же места."""
 
-    # Все модели в порядке приоритета
-    models = ["gpt-4o", "gpt-4", "gpt-3.5-turbo"]
-    
-    # === ПОПЫТКА 1: основной промпт через все модели ===
-    for model_name in models:
+    # === ПОПЫТКА 1: основной промпт через все доступные модели ===
+    for model_name in _MODELS:
         try:
             print(f"      [AI] Пишем гайд через {model_name}...")
-            response = g4f.ChatCompletion.create(
-                model=model_name, 
-                messages=[{"role": "user", "content": prompt_main}]
-            )
+            response = _ask_ai(model_name, [{"role": "user", "content": prompt_main}])
             if not response or len(response) < 100:
                 continue
             
@@ -124,21 +176,15 @@ def ai_generate_full_content(idea, game_name):
             # Гайд короткий? → пробуем ДОПИСАТЬ через ту же модель
             if len(result) > 200:
                 print(f"      [AI] Гайд короткий ({_count_words(result)} слов). Просим дописать...")
-                try:
-                    more = g4f.ChatCompletion.create(
-                        model=model_name,
-                        messages=[
-                            {"role": "user", "content": prompt_main},
-                            {"role": "assistant", "content": result},
-                            {"role": "user", "content": prompt_continue}
-                        ]
-                    )
-                    if more and not _is_refused(more):
-                        result = result + "\n\n" + more.strip()
-                        if _is_guide_good(result):
-                            return result
-                except:
-                    pass
+                more = _ask_ai(model_name, [
+                    {"role": "user", "content": prompt_main},
+                    {"role": "assistant", "content": result},
+                    {"role": "user", "content": prompt_continue},
+                ])
+                if more and not _is_refused(more):
+                    result = result + "\n\n" + more.strip()
+                    if _is_guide_good(result):
+                        return result
             
             # Даже если после дописывания всё ещё короткий — возвращаем,
             # потому что лучше короткий гайд чем никакого
@@ -161,13 +207,10 @@ def ai_generate_full_content(idea, game_name):
 
 НЕ упоминай ИИ, нейросеть, отказы. Пиши как человек. Минимум 600 слов."""
     
-    for model_name in models:
+    for model_name in _MODELS:
         try:
             print(f"      [AI] Пробуем другой промпт ({model_name})...")
-            response = g4f.ChatCompletion.create(
-                model=model_name, 
-                messages=[{"role": "user", "content": prompt_alt}]
-            )
+            response = _ask_ai(model_name, [{"role": "user", "content": prompt_alt}])
             if not response or len(response) < 100:
                 continue
             if _is_refused(response):
@@ -180,14 +223,11 @@ def ai_generate_full_content(idea, game_name):
             continue
     
     # === ПОПЫТКА 3: каждая модель по 2 раза (иногда один и тот же модель даёт разный результат) ===
-    for model_name in models:
+    for model_name in _MODELS:
         for attempt in range(2):
             try:
                 print(f"      [AI] Повторная попытка {attempt+1} ({model_name})...")
-                response = g4f.ChatCompletion.create(
-                    model=model_name, 
-                    messages=[{"role": "user", "content": prompt_main}]
-                )
+                response = _ask_ai(model_name, [{"role": "user", "content": prompt_main}])
                 if not response or len(response) < 100:
                     continue
                 if _is_refused(response):
@@ -202,7 +242,7 @@ def ai_generate_full_content(idea, game_name):
                 continue
     
     # ВСЕ попытки провалились — пропускаем товар
-    print(f"      ⚠️ Все попытки ИИ провалились. Пропускаем товар.")
+    print("      ⚠️ Все попытки ИИ провалились. Пропускаем товар.")
     return None
 
 def ai_translate_to_en(text):
@@ -219,15 +259,10 @@ IMPORTANT RULES:
 Russian text to translate:
 
 {text}"""
-    for model_name in ["gpt-4o", "gpt-3.5-turbo"]:
-        try:
-            response = g4f.ChatCompletion.create(
-                model=model_name, 
-                messages=[{"role": "user", "content": prompt}]
-            )
-            if response and len(response.strip()) > 50:
-                return response.strip()
-        except: continue
+    for model_name in _MODELS[:2]:
+        response = _ask_ai(model_name, [{"role": "user", "content": prompt}])
+        if response and len(response.strip()) > 50:
+            return response.strip()
     # Длинный фоллбэк для desc[en] — чтобы пройти минимум 500 символов
     return ("High quality gaming service with professional guides and expert strategies. "
             "We provide instant automated delivery 24/7 with full support. "
