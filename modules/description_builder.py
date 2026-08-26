@@ -23,7 +23,7 @@ def generate_full_description_ruble(idea, game_name):
     t = idea['title'].upper()
     gn = game_name.upper()
     points = "\n".join([f"• {p}" for p in idea.get('content_points', [])])
-    e = random.sample(EMOJI_BANK, 5)
+    emojis = random.sample(EMOJI_BANK, 5)
 
     # ВИД 1: ПОШАГОВЫЙ ГАЙД (Ваш пример 1)
     v1 = f"""
@@ -98,10 +98,9 @@ def generate_full_description_ruble(idea, game_name):
 """
 
     # ВИД 6: ОРИГИНАЛ
-    re = random.sample(EMOJI_BANK, 5)
     v6 = f"""
-{re[0]} Мгновенный доступ к {gn} {re[0]}
-{re[1]} Выдача АВТОМАТИЧЕСКИ 24/7 {re[1]}
+{emojis[0]} Мгновенный доступ к {gn} {emojis[0]}
+{emojis[1]} Выдача АВТОМАТИЧЕСКИ 24/7 {emojis[1]}
 📌 СОДЕРЖАНИЕ ТОВАРА:
 {points}
 ✅ Проверенная информация

@@ -4,6 +4,7 @@ LIMITS = {
     "summary_max": 70,           # FunPay считает по байтам, эмодзи = 3-4 байта каждый
     "summary_max_bytes": 120,    # Байтовый лимит для summary (FunPay считает байты, не символы)
     "description_min_ru": 200,
+    "description_max_ru": 3000,
     "description_min_en": 500,   # FunPay требует минимум ~500 для desc[en], 300 недостаточно
     "payment_msg_min_en": 300,   # FunPay требует минимум 300 символов для английских полей
     "payment_msg_max": 1000
