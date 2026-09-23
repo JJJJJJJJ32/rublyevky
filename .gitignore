@@ -22,3 +22,7 @@ data/products_links.json
 # Кэш
 __pycache__/
 .pytest_cache/
+
+# Cloudflare Worker (локальные секреты wrangler)
+worker/.dev.vars
+worker/.wrangler/

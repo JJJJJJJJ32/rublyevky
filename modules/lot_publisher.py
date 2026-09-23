@@ -122,7 +122,15 @@ def publish_lot(session, game_data, short_description, full_description, payment
         resp = session.get(edit_url, timeout=25)
         
         # Проверка Cloudflare бана
-        if resp.status_code == 403 or "cf-browser-verification" in resp.text.lower() or "just a moment" in resp.text.lower() or "cloudflare" in resp.text.lower() and len(resp.text) < 5000:
+        # (скобки важны: без них «len(resp.text) < 5000» относилось бы только к ветке "cloudflare")
+        body_low = resp.text.lower()
+        cloudflare_challenge = (
+            resp.status_code == 403
+            or "cf-browser-verification" in body_low
+            or "just a moment" in body_low
+            or ("cloudflare" in body_low and len(resp.text) < 5000)
+        )
+        if cloudflare_challenge:
             print(f"      🚫 Cloudflare заблокировал IP. Требуется пауза.")
             return "cloudflare_banned"
         

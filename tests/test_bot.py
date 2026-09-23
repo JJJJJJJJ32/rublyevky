@@ -12,11 +12,11 @@ class _MockG4f:
             return "Mock response"
 sys.modules['g4f'] = _MockG4f()
 
-# Мокаем dotenv
-class _MockDotenv:
-    pass
-sys.modules['dotenv'] = _MockDotenv()
-sys.modules['dotenv.load_dotenv'] = _MockDotenv()
+# Мокаем dotenv — модули бота делают `from dotenv import load_dotenv`
+import types as _types
+_dotenv_stub = _types.ModuleType("dotenv")
+_dotenv_stub.load_dotenv = lambda *args, **kwargs: False
+sys.modules['dotenv'] = _dotenv_stub
 
 # Мокаем slugify
 def _mock_slugify(text, **kwargs):
