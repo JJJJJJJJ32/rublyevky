@@ -1,13 +1,23 @@
 import os
 import re
 import pickle
-from google_auth_oauthlib.flow import InstalledAppFlow
-from google.auth.transport.requests import Request
-from googleapiclient.discovery import build
-from googleapiclient.http import MediaFileUpload
 from dotenv import load_dotenv
 
 load_dotenv()
+
+# Библиотеки Google подключаем мягко: если их нет, бот должен сказать
+# «установи зависимости», а не падать с многоэтажной ошибкой.
+try:
+    from google_auth_oauthlib.flow import InstalledAppFlow
+    from google.auth.transport.requests import Request
+    from googleapiclient.discovery import build
+    from googleapiclient.http import MediaFileUpload
+    GOOGLE_LIBS_OK = True
+    GOOGLE_LIBS_ERROR = ""
+except ImportError as e:
+    InstalledAppFlow = Request = build = MediaFileUpload = None
+    GOOGLE_LIBS_OK = False
+    GOOGLE_LIBS_ERROR = str(e)
 
 CLIENT_SECRETS_FILE = "client_secrets.json"
 TOKEN_FILE = "token.json"
@@ -19,7 +29,12 @@ class GoogleDriveManager:
 
     def _authenticate(self):
         if self.service: return self.service
-        
+
+        if not GOOGLE_LIBS_OK:
+            print("   [!] Библиотеки Google не установлены. Выполни: pip install -r requirements.txt")
+            print(f"   [!] Подробности: {GOOGLE_LIBS_ERROR}")
+            return None
+
         creds = None
         if os.path.exists(TOKEN_FILE):
             with open(TOKEN_FILE, 'rb') as token:
@@ -77,5 +92,43 @@ class GoogleDriveManager:
         media = MediaFileUpload(file_path, mimetype='text/plain')
         file = service.files().create(body=file_metadata, media_body=media, fields='id, webViewLink').execute()
         return file.get('webViewLink')
+
+    def self_test(self):
+        """
+        Проверка для режима --selftest: доступен ли Диск и можно ли писать в папку.
+        Создаёт временную папку и сразу её удаляет, ничего не оставляя после себя.
+        Возвращает (успех: bool, сообщение: str).
+        """
+        if not os.getenv("GOOGLE_DRIVE_FOLDER_ID"):
+            return False, "GOOGLE_DRIVE_FOLDER_ID не задан в .env"
+
+        service = self._authenticate()
+        if not service:
+            return False, "не удалось авторизоваться (проверь client_secrets.json / token.json)"
+
+        parent_id = self._clean_id(os.getenv("GOOGLE_DRIVE_FOLDER_ID"))
+        temp_id = None
+        try:
+            folder = service.files().create(
+                body={'name': '_selftest_tmp', 'mimeType': 'application/vnd.google-apps.folder',
+                      'parents': [parent_id]},
+                fields='id'
+            ).execute()
+            temp_id = folder.get('id')
+            service.permissions().create(
+                fileId=temp_id, body={'type': 'anyone', 'role': 'reader'}
+            ).execute()
+            return True, "Диск доступен, папка создаётся и выдаются права на чтение"
+        except Exception as e:
+            message = str(e)
+            if "notFound" in message or "File not found" in message:
+                message = "папка из GOOGLE_DRIVE_FOLDER_ID не найдена или не расшарена сервисному аккаунту"
+            return False, message
+        finally:
+            if temp_id:
+                try:
+                    service.files().delete(fileId=temp_id).execute()
+                except Exception:
+                    pass
 
 gdrive = GoogleDriveManager()
