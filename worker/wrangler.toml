@@ -1,0 +1,20 @@
+# Настройки Cloudflare Worker'а с ИИ.
+# Деплой: wrangler deploy  (или вставь worker.js в веб-панели Cloudflare — см. README.md)
+
+name = "ai-worker"
+main = "worker.js"
+compatibility_date = "2026-09-01"
+
+# Smart Placement: Cloudflare сам решает, в каком дата-центре выполнять запрос,
+# чтобы он был ближе к источнику данных (например, к Google или Groq).
+[placement]
+mode = "smart"
+
+# Привязка Workers AI — то, что даёт доступ к бесплатным моделям Cloudflare.
+[ai]
+binding = "AI"
+
+# Переменные окружения. Секреты (PROXY_TOKEN, GEMINI_API_KEY и т.д.)
+# НЕ пиши сюда — добавляй их командой:  wrangler secret put PROXY_TOKEN
+[vars]
+EXTRA_MODELS = ""
