@@ -176,7 +176,7 @@ https://one.one.one.one/cdn-cgi/trace
 
 | Было | Стало |
 |---|---|
-| `modules/network.py` — 913 строк: поиск Запрета, `winws.exe`, WARP, `warp-cli`, `route add/delete`, авто-починка | **207 строк**: сессия + проверка FunPay + понятные причины сбоя + необязательный `PROXY_URL` |
+| `modules/network.py` — 913 строк: поиск Запрета, `winws.exe`, WARP, `warp-cli`, `route add/delete`, авто-починка | **176 строк**: сессия + проверка FunPay + понятные причины сбоя + необязательный `PROXY_URL` |
 | `main.py` управлял сетью, ждал по 5 минут, не логировал ошибки | Управления системой нет; `--selftest` за 30 секунд; ошибки идут в `logs/errors.log` |
 | Временные `.txt` оставались при ошибках публикации | Файл удаляется сразу после загрузки на Drive |
 | `wemod_result` не проверялся | Проверяется: успех / лимит / пауза / лог |
@@ -197,7 +197,7 @@ https://one.one.one.one/cdn-cgi/trace
 
 ### Проверки
 
-- **97 тестов** проходят (`python -m pytest tests/`): 47 старых + тесты `ai_client` (локальный «Worker» на stdlib) и `network`.
+- **97 тестов** проходят (`python -m pytest tests/`): 47 старых + 26 в `tests/test_ai_client.py` + 24 в `tests/test_network.py`.
 - Сквозная проверка на локальном «Worker'е»: health → идеи (12) → гайд (594 слова, проверка качества пройдена) → перевод → журнал расхода.
 - `py main.py --selftest` на машине без `.env` и без Worker'а не падает, а объясняет каждый пункт.
 
