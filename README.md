@@ -156,11 +156,20 @@
 
 ### Хочешь модели посерьёзнее (Gemini / Groq)?
 
-Добавь в настройках Worker'а секрет `GEMINI_API_KEY` (или `GROQ_API_KEY`) и укажи в `.env`:
+Добавь в настройках Worker'а секрет `GEMINI_API_KEY` (или `GROQ_API_KEY`):
+
+```powershell
+npx --yes wrangler secret put GEMINI_API_KEY
 ```
-AI_MODEL_PRIORITY=gemini-2.5-flash,@cf/openai/gpt-oss-120b
+
+Для создания Gemini API-ключа нужен аккаунт Google из поддерживаемого региона. Бесплатные
+запросы могут использоваться Google для улучшения моделей — не отправляй туда секреты.
+
+Затем укажи приоритет в `.env`:
 ```
-Бот идёт по списку слева направо: не ответила первая модель — берёт следующую.
+AI_MODEL_PRIORITY=gemini-3.6-flash,@cf/qwen/qwen3-30b-a3b-fp8,@cf/openai/gpt-oss-120b
+```
+Бот идёт по списку слева направо: если первая модель получила лимит — берёт следующую.
 
 ---
 

@@ -56,9 +56,20 @@
 
 После этого в бота можно вписать приоритет моделей в `.env`:
 ```
-AI_MODEL_PRIORITY=gemini-2.5-flash,@cf/openai/gpt-oss-120b
+AI_MODEL_PRIORITY=gemini-3.6-flash,@cf/qwen/qwen3-30b-a3b-fp8,@cf/openai/gpt-oss-120b
 ```
-Бот идёт по списку слева направо: если первая модель не ответила — берёт следующую.
+Бот идёт по списку слева направо: если первая модель получила `429`, он автоматически
+переходит к следующей. Если все модели исчерпали лимит, главный цикл ждёт сброса.
+
+Актуальные имена Gemini для этого Worker: `gemini-3.8-flash`, `gemini-3.7-flash`,
+`gemini-3.6-flash`, `gemini-3.5-flash`, `gemini-3.5-flash-lite` и
+`gemini-3.1-flash-lite`. Для обычных гайдов достаточно начать с `gemini-3.6-flash`
+или более новой `gemini-3.8-flash`. Модель `gemini-3.8-flash` — самый свежий стабильный
+вариант на момент обновления инструкции.
+
+Ключ Gemini создаётся только из поддерживаемого региона Google. Бесплатные запросы могут
+использоваться Google для улучшения моделей, поэтому не отправляй через этот канал секреты
+и персональные данные.
 
 ---
 
@@ -78,6 +89,8 @@ wrangler deploy
 # 4. Задать секреты
 wrangler secret put PROXY_TOKEN
 wrangler secret put GEMINI_API_KEY     # необязательно
+# То же самое без глобальной установки Wrangler:
+# npx --yes wrangler secret put GEMINI_API_KEY
 wrangler secret put GROQ_API_KEY       # необязательно
 wrangler secret put OPENROUTER_API_KEY # необязательно
 ```
@@ -94,16 +107,17 @@ wrangler secret put OPENROUTER_API_KEY # необязательно
 ```json
 {
   "ok": true,
-  "version": "1.0",
+  "version": "1.1",
   "colo": "DME",
   "providers": { "cloudflare": true, "gemini": false, "groq": false, "openrouter": false },
-  "models": ["@cf/openai/gpt-oss-120b", "@cf/qwen/qwen3-30b-a3b-fp8", "@cf/openai/gpt-oss-20b"]
+  "models": ["@cf/qwen/qwen3-30b-a3b-fp8", "@cf/openai/gpt-oss-120b", "@cf/openai/gpt-oss-20b"]
 }
 ```
 
 - `"ok": true` — Worker жив.
 - `colo` — дата-центр Cloudflare, который обслуживает запрос (`DME` = Москва, `LED` = Санкт-Петербург и т.д.).
-- `providers.cloudflare: true` — бесплатные модели подключены.
+- `providers.cloudflare: true` — binding Workers AI подключён.
+- `providers.cloudflare: false` и поле `hint` — binding `AI` не подключён, бесплатные модели пока недоступны.
 - `providers.gemini: false` — ключ Gemini не задан (это нормально, если он тебе не нужен).
 
 Проверка запроса к модели (подставь свой токен):
@@ -122,7 +136,7 @@ curl -X POST https://ai-worker.твой-логин.workers.dev/v1/chat/completio
 - Расход зависит от модели. Одна «игра» в боте (12 идей + 15 гайдов + переводы) — это примерно:
   - `@cf/openai/gpt-oss-120b` — **4–5 игр в сутки** на бесплатном лимите
   - `@cf/qwen/qwen3-30b-a3b-fp8` — **~9 игр в сутки**
-- Если лимит выбран — бот не падает, а ждёт сброса (Worker отдаёт `429` с типом `ai_limit_reached`).
+- Если лимит выбран — бот сначала пробует следующую модель из списка приоритета. Если все модели вернули `429`, главный цикл ждёт сброса.
 - **Платно:** тариф Workers $5/мес, дальше $0.011 за 1 000 нейронов. Одна игра ≈ 2.4 ₽.
 
 ---
@@ -136,5 +150,5 @@ curl -X POST https://ai-worker.твой-логин.workers.dev/v1/chat/completio
 | `500 server_not_configured` | Секрет `PROXY_TOKEN` не задан | Добавить в Settings → Variables and Secrets |
 | `no_binding` | Не подключён Workers AI | Settings → Bindings → Workers AI с именем `AI` (или способ №2) |
 | `429 ai_limit_reached` | Исчерпаны 10 000 нейронов на сутки | Подождать до 03:00 МСК или подключить платный тариф |
-| Модель отвечает, но по-английски | Модель не держит русский | Смени приоритет в `.env`: `AI_MODEL_PRIORITY=@cf/openai/gpt-oss-120b,...` |
+| Модель отвечает, но по-английски | Модель не держит русский | Смени приоритет в `.env`: `AI_MODEL_PRIORITY=gemini-3.6-flash,@cf/qwen/qwen3-30b-a3b-fp8,...` |
 | Gemini в `/health` есть, но отвечает ошибкой региона | Google отказал по гео (Worker выполняется в РФ — `colo: DME/LED`) | Включить Smart Placement (есть в `wrangler.toml`) или ходить через Groq |

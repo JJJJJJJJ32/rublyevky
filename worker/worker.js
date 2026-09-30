@@ -4,7 +4,7 @@
  * Что делает:
  *   POST /v1/chat/completions  — совместимо с форматом OpenAI.
  *        model = "@cf/..."            → модель самого Cloudflare (ключи не нужны)
- *        model = "gemini-2.5-flash"   → Google Gemini (нужен GEMINI_API_KEY в секретах)
+ *        model = "gemini-3.8-flash"   → Google Gemini (нужен GEMINI_API_KEY в секретах)
  *        model = "llama-3.3-70b"      → Groq (нужен GROQ_API_KEY)
  *        model = "openrouter/..."     → OpenRouter (нужен OPENROUTER_API_KEY)
  *   GET  /health               — проверка: жив ли Worker, в каком он дата-центре,
@@ -21,7 +21,10 @@
  *                        показывается в /health (на работу не влияет).
  */
 
-const VERSION = "1.0";
+const VERSION = "1.1";
+// gpt-oss тратит часть max_tokens на внутреннее рассуждение. Если дать ему
+// слишком маленький лимит, наружу может прийти пустой ответ.
+const MIN_OUTPUT_TOKENS = 1536;
 
 // Модели Cloudflare, которые имеет смысл ставить в приоритет.
 // Полный список: https://developers.cloudflare.com/workers-ai/models/
@@ -33,10 +36,14 @@ const DEFAULT_CF_MODELS = [
 
 // Внешние провайдеры: имя модели → { адрес, имя секрета с ключом }
 const UPSTREAMS = {
-  // Google Gemini (OpenAI-совместимый вход)
-  "gemini-2.5-flash": { url: "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions", key: "GEMINI_API_KEY" },
-  "gemini-2.5-pro": { url: "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions", key: "GEMINI_API_KEY" },
-  "gemini-2.0-flash": { url: "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions", key: "GEMINI_API_KEY" },
+  // Google Gemini (OpenAI-совместимый вход).
+  // Имена сверены с актуальным списком Gemini API на сентябрь 2026.
+  "gemini-3.8-flash": { url: "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions", key: "GEMINI_API_KEY" },
+  "gemini-3.7-flash": { url: "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions", key: "GEMINI_API_KEY" },
+  "gemini-3.6-flash": { url: "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions", key: "GEMINI_API_KEY" },
+  "gemini-3.5-flash": { url: "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions", key: "GEMINI_API_KEY" },
+  "gemini-3.5-flash-lite": { url: "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions", key: "GEMINI_API_KEY" },
+  "gemini-3.1-flash-lite": { url: "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions", key: "GEMINI_API_KEY" },
   // Groq
   "llama-3.3-70b": { url: "https://api.groq.com/openai/v1/chat/completions", key: "GROQ_API_KEY", remote: "llama-3.3-70b-versatile" },
   "gpt-oss-120b": { url: "https://api.groq.com/openai/v1/chat/completions", key: "GROQ_API_KEY", remote: "openai/gpt-oss-120b" },
@@ -63,19 +70,23 @@ export default {
     }
 
     if (url.pathname === "/health") {
-      return json({
+      const health = {
         ok: true,
         version: VERSION,
         colo: (request.cf && request.cf.colo) || "unknown",
         country: (request.cf && request.cf.country) || "unknown",
         providers: {
-          cloudflare: true,
+          cloudflare: Boolean(env.AI),
           gemini: Boolean(env.GEMINI_API_KEY),
           groq: Boolean(env.GROQ_API_KEY),
           openrouter: Boolean(env.OPENROUTER_API_KEY),
         },
         models: availableModels(env),
-      });
+      };
+      if (!env.AI) {
+        health.hint = "Workers AI не подключён: добавь binding AI в Settings → Bindings";
+      }
+      return json(health);
     }
 
     if (url.pathname === "/v1/chat/completions") {
@@ -122,7 +133,7 @@ function availableModels(env) {
     .split(",")
     .map((m) => m.trim())
     .filter(Boolean);
-  const list = [...DEFAULT_CF_MODELS, ...cf];
+  const list = env.AI ? [...DEFAULT_CF_MODELS, ...cf] : [...cf];
   for (const [name, cfg] of Object.entries(UPSTREAMS)) {
     if (env[cfg.key]) list.push(name);
   }
@@ -197,7 +208,14 @@ async function runCloudflareModel(model, body, env) {
   }
 
   const payload = { messages: body.messages };
-  if (body.max_tokens) payload.max_tokens = body.max_tokens;
+  const requestedMaxTokens = Number(body.max_tokens);
+  if (model.includes("gpt-oss")) {
+    payload.max_tokens = Number.isFinite(requestedMaxTokens)
+      ? Math.max(requestedMaxTokens, MIN_OUTPUT_TOKENS)
+      : MIN_OUTPUT_TOKENS;
+  } else if (Number.isFinite(requestedMaxTokens) && requestedMaxTokens > 0) {
+    payload.max_tokens = requestedMaxTokens;
+  }
   if (body.temperature !== undefined) payload.temperature = body.temperature;
 
   try {

@@ -33,8 +33,11 @@ GOLDEN_KEY=твой_золотой_ключ_от_funpay
 GOOGLE_DRIVE_FOLDER_ID=айди_папки_на_гугл_диске
 AI_WORKER_URL=https://ai-worker.твой-логин.workers.dev
 AI_WORKER_TOKEN=пароль_из_настроек_воркера
-AI_MODEL_PRIORITY=@cf/openai/gpt-oss-120b,@cf/qwen/qwen3-30b-a3b-fp8
+AI_MODEL_PRIORITY=@cf/qwen/qwen3-30b-a3b-fp8,@cf/openai/gpt-oss-120b
 ```
+
+> Для запасного Gemini после добавления ключа в Worker можно указать:
+> `AI_MODEL_PRIORITY=gemini-3.6-flash,@cf/qwen/qwen3-30b-a3b-fp8,@cf/openai/gpt-oss-120b`.
 
 > Файл должен называться именно `.env`, а не `.env.txt` (в блокноте при сохранении выбери «Все файлы»).
 > Значения `AI_WORKER_URL` и `AI_WORKER_TOKEN` появятся у тебя в пункте 4.
@@ -66,6 +69,24 @@ AI_MODEL_PRIORITY=@cf/openai/gpt-oss-120b,@cf/qwen/qwen3-30b-a3b-fp8
 - [ ] Скопируй адрес Worker'а (вида `https://ai-worker.логин.workers.dev`):
   - [ ] открой в браузере `твой-адрес/health` — должно быть `"ok": true`
   - [ ] впиши адрес и токен в `.env` (пункт 2)
+
+### Запасной Gemini (необязательно)
+
+Если нужен запасной канал после лимита Cloudflare:
+
+```powershell
+npx --yes wrangler secret put GEMINI_API_KEY
+```
+
+После этого в `.env` можно поставить приоритет:
+
+```text
+AI_MODEL_PRIORITY=gemini-3.6-flash,@cf/qwen/qwen3-30b-a3b-fp8,@cf/openai/gpt-oss-120b
+```
+
+Для создания ключа Gemini нужен аккаунт Google из поддерживаемого региона. Google может
+использовать запросы бесплатного тарифа для улучшения своих моделей — не отправляй туда
+секреты и персональные данные.
 
 ---
 
@@ -125,7 +146,7 @@ py main.py                # рабочий запуск
 |---|---|
 | `AI_WORKER_URL не задан` | Заполни пункт 4 и впиши адрес в `.env` |
 | `Worker отклонил токен` | `AI_WORKER_TOKEN` в `.env` должен точно совпадать с секретом `PROXY_TOKEN` в Worker'е |
-| `429 ai_limit_reached` | Закончились бесплатные 10 000 нейронов на сутки (сброс в 03:00 МСК). Бот сам подождёт |
+| `429 ai_limit_reached` | Бот сначала пробует следующую модель из `AI_MODEL_PRIORITY`; если запасных нет, ждёт сброса лимита в 03:00 МСК |
 | `не найден client_secrets.json` | Ключ Google не лежит рядом с `main.py` или назван иначе |
 | `папка ... не найдена — поделись ею с сервисным аккаунтом` | Расшарь папку на email из `client_secrets.json` (пункт 3) |
 | `FunPay недоступен` | Проверь funpay.com в браузере; если не открывается — впиши `PROXY_URL=...` в `.env` |

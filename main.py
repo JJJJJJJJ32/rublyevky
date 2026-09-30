@@ -2,6 +2,7 @@ import os
 import sys
 import random
 import time
+from concurrent.futures import ThreadPoolExecutor
 
 from slugify import slugify
 
@@ -81,27 +82,77 @@ def _publish_with_heal(session, net_session, game_id, short, full, pay_msg, pric
     return result, session, net_session
 
 
+def _generate_ideas_timed(game_name):
+    started = time.perf_counter()
+    ideas = ai_generate_product_ideas(game_name) or []
+    return ideas, time.perf_counter() - started
+
+
+def _generate_content_timed(idea, game_name):
+    started = time.perf_counter()
+    content = ai_generate_full_content(idea, game_name)
+    return content, time.perf_counter() - started
+
+
+def _print_game_metrics(game_name, metrics):
+    total_seconds = time.perf_counter() - metrics["started"]
+    requests_before, tokens_before = metrics["ai_before"]
+    requests_after, tokens_after = ai_client.used_today()
+    requests_delta = max(0, requests_after - requests_before)
+    tokens_delta = max(0, tokens_after - tokens_before)
+
+    print(
+        f"⏱ [{game_name}] идеи: {metrics['ideas']:.1f} с | "
+        f"гайды: {metrics['guides']:.1f} с ({metrics['guide_count']} шт.) | "
+        f"публикация: {metrics['publishing']:.1f} с ({metrics['publish_count']} лотов) | "
+        f"вся игра: {total_seconds / 60:.1f} мин."
+    )
+    print(
+        f"   [AI] За игру: запросов {requests_delta}, "
+        f"токенов {tokens_delta} (по logs/ai_usage.jsonl)"
+    )
+
+
 def process_single_game(session, game_data, net_session):
-    game_name = game_data['game_name']
-    found = find_funpay_category(session, game_name)
-    if not found:
-        print(f"   [!] Игра '{game_name}' не найдена. Пропуск.")
-        remove_game_from_list(game_name)
-        return session, net_session
-
-    game_id = found['id']
-    if is_game_processed(game_id):
-        remove_game_from_list(game_name)
-        return session, net_session
-
-    print(f"\n🌍 РАЗДЕЛ: {get_category_info(session, game_id)} ({found['type']})")
-    print(f"📊 ИГРА: {game_name.upper()}")
-
-    # 15 товаров: 3 обязательных + 12 от ИИ
-    ai_ideas = ai_generate_product_ideas(game_name) or []
-    final_ideas = MANDATORY_PRODUCTS + ai_ideas[:12]
+    game_name = game_data["game_name"]
+    metrics = {
+        "started": time.perf_counter(),
+        "ai_before": ai_client.used_today(),
+        "ideas": 0.0,
+        "guides": 0.0,
+        "publishing": 0.0,
+        "guide_count": 0,
+        "publish_count": 0,
+    }
+    content_pool = None
+    content_future = None
 
     try:
+        # Идеи запрашиваем сразу, одновременно с поиском раздела на FunPay.
+        # Это экономит время, но не создаёт очередь из десятков запросов.
+        with ThreadPoolExecutor(max_workers=1) as preparation_pool:
+            ideas_future = preparation_pool.submit(_generate_ideas_timed, game_name)
+            found = find_funpay_category(session, game_name)
+
+            if not found:
+                print(f"   [!] Игра '{game_name}' не найдена. Пропуск.")
+                remove_game_from_list(game_name)
+                return session, net_session
+
+            game_id = found["id"]
+            if is_game_processed(game_id):
+                remove_game_from_list(game_name)
+                return session, net_session
+
+            ai_ideas, ideas_seconds = ideas_future.result()
+            metrics["ideas"] = ideas_seconds
+
+        print(f"\n🌍 РАЗДЕЛ: {get_category_info(session, game_id)} ({found['type']})")
+        print(f"📊 ИГРА: {game_name.upper()}")
+
+        # 15 товаров: 3 обязательных + 12 от ИИ.
+        final_ideas = MANDATORY_PRODUCTS + ai_ideas[:12]
+
         folder_id = gdrive.create_folder(f"{game_name}_products")
         if not folder_id:
             print("   [!] Не удалось создать папку на Google Drive. Пропускаем игру.")
@@ -109,10 +160,30 @@ def process_single_game(session, game_data, net_session):
             return session, net_session
 
         fail_count = 0
-        for i, idea in enumerate(final_ideas):
-            print(f"📦 [{game_name}] {i+1}/{len(final_ideas)}: {idea['title']}")
+        # В фоне готовится только следующий гайд. Пока он считается, текущий
+        # файл загружается и лот публикуется. Так мы не создаём большой поток
+        # запросов и не упираемся в лимит Worker'а.
+        content_pool = ThreadPoolExecutor(max_workers=2)
 
-            content = ai_generate_full_content(idea, game_name)
+        for i, idea in enumerate(final_ideas):
+            print(f"📦 [{game_name}] {i + 1}/{len(final_ideas)}: {idea['title']}")
+
+            if content_future is not None:
+                content, guide_seconds = content_future.result()
+                content_future = None
+                print("      ⚡ Берём заранее подготовленный гайд...")
+            else:
+                content, guide_seconds = _generate_content_timed(idea, game_name)
+            metrics["guides"] += guide_seconds
+            metrics["guide_count"] += 1
+
+            # Следующий гайд начинает считаться до загрузки и публикации текущего.
+            if i + 1 < len(final_ideas):
+                next_idea = final_ideas[i + 1]
+                content_future = content_pool.submit(
+                    _generate_content_timed, next_idea, game_name
+                )
+
             if not content:
                 print("      ⚠️ Гайд не сгенерирован. Пропускаем товар.")
                 continue
@@ -120,24 +191,26 @@ def process_single_game(session, game_data, net_session):
             file_name = f"{slugify(idea['title'][:30])}_{random.randint(100, 999)}.txt"
             file_path = os.path.join(config.GENERATED_CONTENT_DIR, file_name)
             os.makedirs(config.GENERATED_CONTENT_DIR, exist_ok=True)
-            with open(file_path, "w", encoding="utf-8") as f:
-                f.write(content)
+            with open(file_path, "w", encoding="utf-8") as file:
+                file.write(content)
 
             try:
                 link = gdrive.upload_file(file_path, folder_id)
             finally:
-                # Файл нужен был только для загрузки — убираем сразу,
-                # чтобы папка не забивалась обрывками при ошибках.
+                # Файл нужен только до загрузки и не должен оставаться на диске.
                 if os.path.exists(file_path):
                     os.remove(file_path)
 
-            short = generate_short_description_ruble(idea['title'])
+            short = generate_short_description_ruble(idea["title"])
             full = generate_full_description_ruble(idea, game_name)
             pay_msg = generate_payment_message(link)
 
+            publish_started = time.perf_counter()
             result, session, net_session = _publish_with_heal(
                 session, net_session, game_id, short, full, pay_msg, 1
             )
+            metrics["publishing"] += time.perf_counter() - publish_started
+            metrics["publish_count"] += 1
 
             if result == "cloudflare_banned":
                 print(f"   [🚫] Cloudflare требует проверку. Пауза {config.CLOUDFLARE_PAUSE // 60} мин...")
@@ -162,7 +235,6 @@ def process_single_game(session, game_data, net_session):
                 print("      ⚠️ Русский текст слишком длинный. Пропускаем товар.")
                 continue
 
-            # Неудачи без конкретной ошибки считаем подряд
             if result in ("no_csrf", None):
                 fail_count += 1
                 logger.log_error(f"Публикация без ответа ({game_name}, товар {i + 1}): {result}")
@@ -174,17 +246,25 @@ def process_single_game(session, game_data, net_session):
             else:
                 fail_count = 0
 
-            time.sleep(random.randint(7, 15))
+            # В v18.4 была пауза 3–6 секунд. Длинная пауза 7–15 секунд
+            # здесь не нужна: следующий гайд уже считается в фоне.
+            time.sleep(random.randint(3, 6))
 
-        # WeMod-лот
         if check_wemod_availability(game_name):
             print("💎 СОЗДАНИЕ WEMOD...")
+            publish_started = time.perf_counter()
             wemod_result, session, net_session = _publish_with_heal(
-                session, net_session, game_id,
+                session,
+                net_session,
+                game_id,
                 generate_short_description_wemod(game_name),
                 generate_full_description_wemod(game_name),
-                generate_payment_message(config.WEMOD_FIXED_LINK), 60
+                generate_payment_message(config.WEMOD_FIXED_LINK),
+                60,
             )
+            metrics["publishing"] += time.perf_counter() - publish_started
+            metrics["publish_count"] += 1
+
             if wemod_result == "success":
                 print("      ✅ WeMod-лот выставлен.")
             elif wemod_result == "limit_reached":
@@ -201,10 +281,19 @@ def process_single_game(session, game_data, net_session):
         remove_game_from_list(game_name)
         print(f"✨ {game_name} готово.")
 
-    except Exception as e:
-        print(f"   [!] Ошибка в игре: {e}")
-        logger.log_error(f"Ошибка обработки игры {game_name}: {e}")
+    except ai_client.AILimitReached:
+        # Главный цикл решает, как переждать общий лимит, не удаляя игру.
+        raise
+    except Exception as error:
+        print(f"   [!] Ошибка в игре: {error}")
+        logger.log_error(f"Ошибка обработки игры {game_name}: {error}")
         remove_game_from_list(game_name)
+    finally:
+        if content_future is not None:
+            content_future.cancel()
+        if content_pool is not None:
+            content_pool.shutdown(wait=False, cancel_futures=True)
+        _print_game_metrics(game_name, metrics)
 
     return session, net_session
 
@@ -250,6 +339,8 @@ def run_selftest():
             providers = info.get("providers") or {}
             for name, state in providers.items():
                 print(f"   • {name}: {'✅ ключ есть' if state else '— ключ не задан'}")
+            if info.get("hint"):
+                print(f"   • подсказка: {info['hint']}")
         else:
             print(f"   ❌ {info}")
             problems.append(f"Worker: {info}")
@@ -258,7 +349,9 @@ def run_selftest():
         try:
             text = ai_client.ai_ask(
                 [{"role": "user", "content": "Напиши одно короткое предложение по-русски: тест связи."}],
-                max_tokens=60,
+                # Worker поднимет лимит gpt-oss минимум до 1536,
+                # поэтому короткий selftest больше не получает пустой ответ.
+                max_tokens=1500,
             )
             print(f"   ✅ ИИ ответил: {text.strip()[:120]}")
         except ai_client.AILimitReached as e:
@@ -309,7 +402,7 @@ def run_selftest():
 
 
 def main():
-    print("=== FUNPAY AUTO-BOT v19.0 (без Запрета, ИИ через Cloudflare Worker) ===\n")
+    print("=== FUNPAY AUTO-BOT v19.3 (без Запрета, ИИ через Cloudflare Worker) ===\n")
 
     net_session, net_ok = setup_network()
     if not net_ok:

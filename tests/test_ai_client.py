@@ -69,7 +69,13 @@ class _Handler(BaseHTTPRequestHandler):
         if behaviour == "limit":
             self._send({"error": {"message": "дневной бесплатный лимит нейронов исчерпан", "type": "ai_limit_reached"}}, 429)
             return
+        if behaviour == "limit_first":
+            if not getattr(self.server, "limit_first_done", False):
+                self.server.limit_first_done = True
+                self._send({"error": {"message": "дневной бесплатный лимит нейронов исчерпан", "type": "ai_limit_reached"}}, 429)
+                return
         if behaviour == "error500":
+
             self._send({"error": {"message": "ошибка модели", "type": "ai_error"}}, 502)
             return
         if behaviour == "empty":
@@ -215,6 +221,20 @@ class TestChain:
         with pytest.raises(ai_client.AILimitReached):
             client.chat_chain([{"role": "user", "content": "привет"}], models=["@cf/a", "@cf/b"])
 
+    def test_chain_uses_next_model_after_limit(self, client, worker_url):
+        _, server = worker_url
+        server.behaviour = "limit_first"
+        server.limit_first_done = False
+
+        text, model = client.chat_chain(
+            [{"role": "user", "content": "привет"}],
+            models=["gemini-3.6-flash", "@cf/qwen/qwen3-30b-a3b-fp8"],
+        )
+
+        assert "Тестовый гайд" in text
+        assert model == "@cf/qwen/qwen3-30b-a3b-fp8"
+        assert server.last_request["model"] == "@cf/qwen/qwen3-30b-a3b-fp8"
+
     def test_chain_raises_when_nothing_works(self, client, worker_url):
         _, server = worker_url
         server.behaviour = "error500"
@@ -229,13 +249,14 @@ class TestChain:
 class TestSettings:
 
     def test_model_priority_from_env(self, monkeypatch):
-        monkeypatch.setenv("AI_MODEL_PRIORITY", "gemini-2.5-flash, @cf/openai/gpt-oss-120b")
-        assert ai_client.get_model_priority() == ["gemini-2.5-flash", "@cf/openai/gpt-oss-120b"]
+        monkeypatch.setenv("AI_MODEL_PRIORITY", "gemini-3.6-flash, @cf/qwen/qwen3-30b-a3b-fp8")
+        assert ai_client.get_model_priority() == ["gemini-3.6-flash", "@cf/qwen/qwen3-30b-a3b-fp8"]
 
     def test_model_priority_default(self, monkeypatch):
         monkeypatch.delenv("AI_MODEL_PRIORITY", raising=False)
         models = ai_client.get_model_priority()
-        assert models and models[0].startswith("@cf/")
+        assert models[0] == "@cf/qwen/qwen3-30b-a3b-fp8"
+        assert "@cf/openai/gpt-oss-120b" in models
 
     def test_worker_url_strips_slash(self, monkeypatch):
         monkeypatch.setenv("AI_WORKER_URL", "https://example.workers.dev/")
