@@ -13,8 +13,8 @@ modules/ai_client.py — единый клиент ИИ через Cloudflare Wo
   - смена модели — одна строка в настройках Worker'а, бот не перезапускается;
   - бот не ломается, когда очередной внешний сервис меняет защиту.
 
-Если Worker ещё не настроен (нет AI_WORKER_URL в .env) — клиент честно падает
-на g4f (если библиотека установлена), чтобы бот не простаивал.
+Если Worker ещё не настроен (нет AI_WORKER_URL в .env), бот сообщает об этом и просит
+сначала настроить Worker из README.md. Рабочий путь проекта — через личный Worker.
 """
 
 import json
@@ -31,9 +31,9 @@ load_dotenv()
 # ─── Настройки ─────────────────────────────────────────────────────────
 # Порядок моделей: пробуем по очереди, пока какая-нибудь не ответит.
 DEFAULT_MODELS = [
-    "@cf/openai/gpt-oss-120b",        # умная, ~4-5 игр в сутки на бесплатном лимите
-    "@cf/qwen/qwen3-30b-a3b-fp8",     # дешевле по лимиту, ~9 игр в сутки
-    "@cf/openai/gpt-oss-20b",         # запасная
+    "@cf/qwen/qwen3-30b-a3b-fp8",     # быстрая и экономная основная модель
+    "@cf/openai/gpt-oss-120b",        # более сильный запасной вариант
+    "@cf/openai/gpt-oss-20b",         # последний запасной вариант
 ]
 
 REQUEST_TIMEOUT = int(os.getenv("AI_TIMEOUT", "180"))   # секунды на один запрос
@@ -66,7 +66,7 @@ def get_worker_token():
 def get_model_priority():
     """
     Порядок моделей из .env (AI_MODEL_PRIORITY через запятую) или дефолтный.
-    Пример: AI_MODEL_PRIORITY=@cf/openai/gpt-oss-120b,gemini-2.5-flash
+    Пример: AI_MODEL_PRIORITY=gemini-3.6-flash,@cf/qwen/qwen3-30b-a3b-fp8
     """
     raw = (os.getenv("AI_MODEL_PRIORITY") or "").strip()
     if not raw:
@@ -215,12 +215,25 @@ class AIClient:
         """
         chain = list(models or self.models)
         last_error = None
-        for model_name in chain:
+        for index, model_name in enumerate(chain):
             try:
                 text = self.chat(messages, model=model_name, max_tokens=max_tokens, temperature=temperature)
                 return text, model_name
-            except (AILimitReached, AIUnavailable):
-                raise  # лимит и недоступный адрес — не повод перебирать модели
+            except AILimitReached as e:
+                # Лимит одной модели не означает, что закончились все
+                # провайдеры. Например, после Cloudflare пробуем Gemini.
+                last_error = e
+                if index + 1 < len(chain):
+                    print(
+                        f"      [AI] ⚠️ {model_name}: лимит исчерпан. "
+                        f"Пробуем следующую модель {chain[index + 1]}..."
+                    )
+                    continue
+                print(f"      [AI] ⚠️ {model_name}: лимит исчерпан, запасных моделей больше нет.")
+            except AIUnavailable:
+                # Адрес Worker'а один для всех моделей: если он совсем
+                # недоступен, повторять тот же запрос к нему бессмысленно.
+                raise
             except AIError as e:
                 last_error = e
                 print(f"      [AI] ⚠️ {model_name} не справилась: {e}. Пробуем следующую...")
@@ -347,7 +360,7 @@ def _ask_g4f(messages, models=None):
     except ImportError:
         raise AIUnavailable(
             "ИИ не настроен: в .env нет AI_WORKER_URL, а библиотека g4f не установлена. "
-            "Поднимите Cloudflare Worker (см. worker/README.md) и впишите адрес в .env."
+            "Поднимите Cloudflare Worker (см. README.md, раздел 4) и впишите адрес в .env."
         )
 
     fallback_models = [m for m in (models or ["gpt-4o", "gpt-3.5-turbo"]) if not str(m).startswith("@cf/")]

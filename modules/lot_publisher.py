@@ -5,6 +5,7 @@ import re
 import string
 from config import LIMITS
 from modules.ai_generator import ai_translate_to_en
+from modules.description_builder import fit_summary
 
 def truncate_to_bytes(text, max_bytes):
     """Обрезает текст до max_bytes в UTF-8, не разрывая многобайтовые символы
@@ -107,11 +108,10 @@ def publish_lot(session, game_data, short_description, full_description, payment
         edit_url = f"https://funpay.com/lots/offerEdit?node={node_id}"
         save_url = "https://funpay.com/lots/offerSave"
         
-        # Переводы и лимиты
-        # Английский summary: одна строка, байтовый лимит
-        s_en = enforce_limits(ai_translate_to_en(short_description), LIMITS['summary_min'], LIMITS['summary_max'], is_en=True, single_line=True, max_bytes=LIMITS['summary_max_bytes'])
-        # Русский summary: тоже обрезаем по байтам
-        s_ru = enforce_limits(short_description, LIMITS['summary_min'], LIMITS['summary_max'], is_en=False, single_line=True, max_bytes=LIMITS['summary_max_bytes'])
+        # Переводы и лимиты. Summary сначала сокращается по словам и только
+        # потом отправляется в запрос — посимвольной обрезки заголовка нет.
+        s_en = fit_summary(ai_translate_to_en(short_description), is_en=True)
+        s_ru = fit_summary(short_description)
         # Английский description: минимум 500 символов
         f_en = enforce_limits(ai_translate_to_en(full_description), LIMITS['description_min_en'], 3000, is_en=True)
         # Русский description: без изменений
