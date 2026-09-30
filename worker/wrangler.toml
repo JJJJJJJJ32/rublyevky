@@ -1,5 +1,5 @@
 # Настройки Cloudflare Worker'а с ИИ.
-# Деплой: wrangler deploy  (или вставь worker.js в веб-панели Cloudflare — см. README.md)
+# Деплой: wrangler deploy  (или вставь worker.js в веб-панели Cloudflare — см. ../README.md)
 
 name = "ai-worker"
 main = "worker.js"

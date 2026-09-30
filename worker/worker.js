@@ -203,7 +203,7 @@ async function handleChat(request, env) {
 async function runCloudflareModel(model, body, env) {
   if (!env.AI) {
     return json({
-      error: { message: "на Worker'е не подключён Workers AI (binding AI). Смотри worker/README.md", type: "no_binding" },
+      error: { message: "на Worker'е не подключён Workers AI (binding AI). Смотри README.md, раздел 4", type: "no_binding" },
     }, 500);
   }
 

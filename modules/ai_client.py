@@ -13,8 +13,8 @@ modules/ai_client.py — единый клиент ИИ через Cloudflare Wo
   - смена модели — одна строка в настройках Worker'а, бот не перезапускается;
   - бот не ломается, когда очередной внешний сервис меняет защиту.
 
-Если Worker ещё не настроен (нет AI_WORKER_URL в .env) — клиент честно падает
-на g4f (если библиотека установлена), чтобы бот не простаивал.
+Если Worker ещё не настроен (нет AI_WORKER_URL в .env), бот сообщает об этом и просит
+сначала настроить Worker из README.md. Рабочий путь проекта — через личный Worker.
 """
 
 import json
@@ -360,7 +360,7 @@ def _ask_g4f(messages, models=None):
     except ImportError:
         raise AIUnavailable(
             "ИИ не настроен: в .env нет AI_WORKER_URL, а библиотека g4f не установлена. "
-            "Поднимите Cloudflare Worker (см. worker/README.md) и впишите адрес в .env."
+            "Поднимите Cloudflare Worker (см. README.md, раздел 4) и впишите адрес в .env."
         )
 
     fallback_models = [m for m in (models or ["gpt-4o", "gpt-3.5-turbo"]) if not str(m).startswith("@cf/")]

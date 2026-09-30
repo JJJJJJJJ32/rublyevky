@@ -324,14 +324,14 @@ def run_selftest():
         print("   ✅ .env найден")
     print(f"   • GOLDEN_KEY: {'✅ есть' if os.getenv('GOLDEN_KEY') else '❌ нет'}")
     print(f"   • GOOGLE_DRIVE_FOLDER_ID: {'✅ есть' if os.getenv('GOOGLE_DRIVE_FOLDER_ID') else '❌ нет'}")
-    print(f"   • AI_WORKER_URL: {'✅ есть' if ai_client.get_worker_url() else '⚠️ нет (ИИ пойдёт через g4f)'}")
+    print(f"   • AI_WORKER_URL: {'✅ есть' if ai_client.get_worker_url() else '⚠️ нет (настрой Cloudflare Worker)'}")
     print(f"   • AI_WORKER_TOKEN: {'✅ есть' if ai_client.get_worker_token() else '⚠️ нет'}")
     print(f"   • PROXY_URL: {'✅ задан' if get_proxy_url() else '— не задан (ходим напрямую)'}")
 
     # 2. Worker ИИ
     print("\n[2/5] Cloudflare Worker (ИИ)")
     if not ai_client.client.configured:
-        print("   ⚠️ Worker не настроен — пропускаем. Инструкция: worker/README.md")
+        print("   ⚠️ Worker не настроен — пропускаем. Инструкция: README.md, раздел 4")
     else:
         ok, info = ai_client.client.health()
         if ok:
@@ -404,7 +404,7 @@ def run_selftest():
 
 
 def main():
-    print("=== FUNPAY AUTO-BOT v19.3 (без Запрета, ИИ через Cloudflare Worker) ===\n")
+    print("=== FUNPAY AUTO-BOT v19.5 (без Запрета, ИИ через Cloudflare Worker) ===\n")
 
     net_session, net_ok = setup_network()
     if not net_ok:
