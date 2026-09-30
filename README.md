@@ -217,7 +217,7 @@ AI_MODEL_PRIORITY=gemini-3.6-flash,@cf/qwen/qwen3-30b-a3b-fp8,@cf/openai/gpt-oss
 ```
 rublyevky/
 ├── main.py                    ← Главный файл бота (запускать его)
-├── config.py                  ← Настройки (лимиты, эмодзи, User-Agent)
+├── config.py                  ← Настройки (лимиты, обязательные товары, эмодзи)
 ├── .env                       ← Твои секретные ключи (Golden Key, Google Drive)
 ├── client_secrets.json        ← Ключ от Google Cloud (скачиваешь из консоли)
 ├── token.json                 ← Создаётся автоматически после первой авторизации Google (НЕ удаляй!)
@@ -236,6 +236,7 @@ rublyevky/
 │   ├── description_builder.py ← Создание описаний лотов
 │   ├── gdrive_manager.py  ← Работа с Google Drive
 │   ├── ai_client.py       ← Связь с ИИ через Cloudflare Worker
+│   ├── mandatory_products.py ← Выбор обязательных товаров под игру
 │   ├── network.py         ← Проверка связи с FunPay (и необязательный прокси)
 │   ├── duplicate_checker.py ← Проверка дубликатов
 │   ├── wemod_checker.py   ← Проверка наличия в WeMod

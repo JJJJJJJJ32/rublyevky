@@ -9,6 +9,29 @@ LIMITS = {
     "payment_msg_max": 1000
 }
 
+# Три базовых товара. Поля id нужны только для ответа ИИ и не попадают
+# в описание лота — список можно редактировать без изменения кода выбора.
+MANDATORY_PRODUCTS = [
+    {
+        "id": "pc_optimization",
+        "title": "МАНУАЛ ПО ОПТИМИЗАЦИИ ПК ДЛЯ ИГР + НАСТРОЙКА NVIDIA BOOST FPS",
+        "type": "мануал",
+        "content_points": ["Настройка Windows", "NVIDIA Boost", "Исправление FPS"],
+    },
+    {
+        "id": "ping",
+        "title": "10 СПОСОБОВ КАК ПОНИЗИТЬ ВЫСОКИЙ ПИНГ",
+        "type": "инструкция",
+        "content_points": ["Сеть", "DNS", "Задержка соединения"],
+    },
+    {
+        "id": "hwid",
+        "title": "[ СПОСОБ СНЯТЬ БЛОКИРОВКУ С ЖЕЛЕЗА ] [ СМЕНА HWID IP MAC АДРЕС UUID ]",
+        "type": "чит-лист",
+        "content_points": ["HWID", "IP", "MAC", "UUID"],
+    },
+]
+
 # Фиксированная ссылка для WeMod товаров
 WEMOD_FIXED_LINK = "https://drive.google.com/drive/folders/1qyFeH_ZTZH_iWpaVdJgCgCW1ls5CQ_gu?usp=sharing"
 

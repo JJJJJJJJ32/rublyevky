@@ -24,13 +24,8 @@ from modules.network import setup_network, recheck_network, get_proxy_url
 from modules.lot_publisher import publish_lot, get_category_info
 from modules.duplicate_checker import is_game_processed, mark_as_processed
 from modules.category_finder import find_funpay_category
+from modules.mandatory_products import select_mandatory_products
 from modules import ai_client
-
-MANDATORY_PRODUCTS = [
-    {"title": "МАНУАЛ ПО ОПТИМИЗАЦИИ ПК ДЛЯ ИГР + НАСТРОЙКА NVIDIA BOOST FPS", "type": "мануал", "content_points": ["Настройка Win", "NVIDIA Boost", "FPS Fix"]},
-    {"title": "10 СПОСОБОВ КАК ПОНИЗИТЬ ВЫСОКИЙ ПИНГ", "type": "инструкция", "content_points": ["Сеть", "DNS", "Latency"]},
-    {"title": "[ СПОСОБ СНЯТЬ БЛОКИРОВКУ С ЖЕЛЕЗА ] [ СМЕНА HWID IP MAC АДРЕС UUID ]", "type": "чит-лист", "content_points": ["HWID", "IP", "MAC", "UUID"]}
-]
 
 
 def _reconnect(net_session):
@@ -94,6 +89,12 @@ def _generate_content_timed(idea, game_name):
     return content, time.perf_counter() - started
 
 
+def build_final_ideas(game_name, ai_ideas, section_name=""):
+    """Сохраняет 3 обязательных товара + до 12 идей ИИ = максимум 15 лотов."""
+    mandatory = select_mandatory_products(game_name, section_name)
+    return mandatory + list(ai_ideas or [])[:12]
+
+
 def _print_game_metrics(game_name, metrics):
     total_seconds = time.perf_counter() - metrics["started"]
     requests_before, tokens_before = metrics["ai_before"]
@@ -147,11 +148,12 @@ def process_single_game(session, game_data, net_session):
             ai_ideas, ideas_seconds = ideas_future.result()
             metrics["ideas"] = ideas_seconds
 
-        print(f"\n🌍 РАЗДЕЛ: {get_category_info(session, game_id)} ({found['type']})")
+        section_name = get_category_info(session, game_id)
+        print(f"\n🌍 РАЗДЕЛ: {section_name} ({found['type']})")
         print(f"📊 ИГРА: {game_name.upper()}")
 
-        # 15 товаров: 3 обязательных + 12 от ИИ.
-        final_ideas = MANDATORY_PRODUCTS + ai_ideas[:12]
+        # 15 товаров: 3 подходящих обязательных + до 12 от ИИ.
+        final_ideas = build_final_ideas(game_name, ai_ideas, section_name)
 
         folder_id = gdrive.create_folder(f"{game_name}_products")
         if not folder_id:

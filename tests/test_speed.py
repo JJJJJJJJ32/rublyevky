@@ -36,7 +36,7 @@ def test_next_guide_is_prefetched_before_current_lot_is_published(monkeypatch, t
     second = {"title": "Второй товар", "content_points": []}
     prefetch_started = threading.Event()
 
-    monkeypatch.setattr(main, "MANDATORY_PRODUCTS", [first, second])
+    monkeypatch.setattr(main, "select_mandatory_products", lambda game_name, section: [first, second])
     monkeypatch.setattr(main, "_generate_ideas_timed", lambda game_name: ([], 0.01))
     monkeypatch.setattr(
         main,
