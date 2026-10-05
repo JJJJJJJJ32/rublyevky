@@ -1,20 +1,22 @@
 """
 modules/ai_client.py — единый клиент ИИ через Cloudflare Worker.
 
-Зачем: раньше генерация висела на библиотеке g4f (бесплатная обёртка над чужими
-сайтами). Она разваливается каждую неделю, потому что сайты меняют защиту.
-Теперь все запросы идут в СВОЙ Cloudflare Worker:
+Рабочий сценарий: только Gemini (по умолчанию gemini-3.6-flash) через HTTP
+твоего Cloudflare Worker. Gemini SDK в боте не используется, ключ лежит
+в секретах Worker'а, запасного пути через g4f нет — модель не подменяется.
 
-    бот ──► твой Worker ──► 1) модели самого Cloudflare (Workers AI, без ключей)
-                         └─► 2) Gemini / Groq / OpenRouter (ключ лежит в Worker'е)
+Схема:
+
+    бот ──► твой Worker ──► Gemini (ключ GEMINI_API_KEY в секретах Worker'а)
 
 Что это даёт:
   - ключи ИИ не хранятся на ПК;
-  - смена модели — одна строка в настройках Worker'а, бот не перезапускается;
+  - смена модели — одна строка в .env (AI_MODEL_PRIORITY);
   - бот не ломается, когда очередной внешний сервис меняет защиту.
 
-Если Worker ещё не настроен (нет AI_WORKER_URL в .env), бот сообщает об этом и просит
-сначала настроить Worker из README.md. Рабочий путь проекта — через личный Worker.
+Если Worker ещё не настроен (нет AI_WORKER_URL в .env), бот сообщает об этом
+и просит сначала настроить Worker из README.md. Рабочий путь проекта — через
+личный Worker.
 """
 
 import json
@@ -26,14 +28,16 @@ from datetime import datetime
 import requests
 from dotenv import load_dotenv
 
+from modules.logger import logger
+
 load_dotenv()
 
 # ─── Настройки ─────────────────────────────────────────────────────────
-# Порядок моделей: пробуем по очереди, пока какая-нибудь не ответит.
+# Рабочий сценарий использует только Gemini. Модель вызывается через твой
+# Cloudflare Worker по HTTP: Gemini SDK в боте нет и не нужен, ключ лежит
+# в секретах Worker'а. Подменять Gemini другой моделью нельзя.
 DEFAULT_MODELS = [
-    "@cf/qwen/qwen3-30b-a3b-fp8",     # быстрая и экономная основная модель
-    "@cf/openai/gpt-oss-120b",        # более сильный запасной вариант
-    "@cf/openai/gpt-oss-20b",         # последний запасной вариант
+    "gemini-3.6-flash",
 ]
 
 REQUEST_TIMEOUT = int(os.getenv("AI_TIMEOUT", "180"))   # секунды на один запрос
@@ -66,7 +70,7 @@ def get_worker_token():
 def get_model_priority():
     """
     Порядок моделей из .env (AI_MODEL_PRIORITY через запятую) или дефолтный.
-    Пример: AI_MODEL_PRIORITY=gemini-3.6-flash,@cf/qwen/qwen3-30b-a3b-fp8
+    Пример: AI_MODEL_PRIORITY=gemini-3.6-flash
     """
     raw = (os.getenv("AI_MODEL_PRIORITY") or "").strip()
     if not raw:
@@ -191,7 +195,11 @@ class AIClient:
                         continue
 
                     _log_usage(model_name, data.get("usage"), elapsed, len(text))
-                    print(f"      [AI] ✅ {model_name} ответила за {elapsed} с ({len(text)} симв.)")
+                    # Время, модель и объём ответа — только в logs/ai_usage.jsonl
+                    # и logs/errors.log. В обычной консоли этого нет.
+                    logger.info(
+                        f"[AI] {model_name} ответила за {elapsed} с ({len(text)} симв.)"
+                    )
                     return text
 
                 except AILimitReached:
@@ -199,11 +207,14 @@ class AIClient:
                 except requests.exceptions.ConnectionError as e:
                     # Адрес один для всех моделей: если он недоступен,
                     # перебирать модели бессмысленно — сразу понятная ошибка.
+                    logger.info(f"[AI] Worker недоступен: {_short_network_error(e)}")
                     raise AIUnavailable(_short_network_error(e))
                 except requests.exceptions.Timeout:
                     last_error = AIError(f"{model_name}: таймаут {self.timeout} с")
+                    logger.info(f"[AI] {last_error}")
                 except requests.exceptions.RequestException as e:
                     last_error = AIUnavailable(_short_network_error(e))
+                    logger.info(f"[AI] {last_error}")
                 time.sleep(2 * attempt)
 
         raise last_error or AIError("Ни одна модель не ответила")
@@ -224,19 +235,25 @@ class AIClient:
                 # провайдеры. Например, после Cloudflare пробуем Gemini.
                 last_error = e
                 if index + 1 < len(chain):
-                    print(
-                        f"      [AI] ⚠️ {model_name}: лимит исчерпан. "
-                        f"Пробуем следующую модель {chain[index + 1]}..."
+                    logger.info(
+                        f"[AI] {model_name}: лимит исчерпан. "
+                        f"Пробуем следующую модель {chain[index + 1]}"
                     )
                     continue
-                print(f"      [AI] ⚠️ {model_name}: лимит исчерпан, запасных моделей больше нет.")
+                # Цепочка из одного элемента: подменять модель нельзя,
+                # поэтому отдаём понятную ошибку наверх.
+                raise AILimitReached(
+                    f"модель {model_name} ответила лимитом (429): {e}. "
+                    "Запасных моделей в цепочке нет — дождитесь сброса лимита "
+                    "или проверьте квоту провайдера."
+                ) from e
             except AIUnavailable:
                 # Адрес Worker'а один для всех моделей: если он совсем
                 # недоступен, повторять тот же запрос к нему бессмысленно.
                 raise
             except AIError as e:
                 last_error = e
-                print(f"      [AI] ⚠️ {model_name} не справилась: {e}. Пробуем следующую...")
+                logger.info(f"[AI] {model_name} не справилась: {e}")
         raise last_error or AIError("Все модели перебраны, ответа нет")
 
 
@@ -342,34 +359,15 @@ client = AIClient()
 def ai_ask(messages, models=None, max_tokens=None, temperature=None):
     """
     Главная функция для остального кода.
-    1. Если Worker настроен — идём в него.
-    2. Если нет — пробуем g4f (если установлен), чтобы бот не простаивал.
+    Все запросы идут в свой Cloudflare Worker по HTTP. Других путей нет:
+    ни Gemini SDK, ни g4f в боте не используются.
     Возвращает текст ответа.
     """
-    if client.configured:
-        text, _ = client.chat_chain(messages, models=models, max_tokens=max_tokens, temperature=temperature)
-        return text
-
-    return _ask_g4f(messages, models)
-
-
-def _ask_g4f(messages, models=None):
-    """Запасной путь: старая бесплатная библиотека. Работает, пока её не сломают."""
-    try:
-        import g4f  # noqa: F401
-    except ImportError:
+    if not client.configured:
         raise AIUnavailable(
-            "ИИ не настроен: в .env нет AI_WORKER_URL, а библиотека g4f не установлена. "
-            "Поднимите Cloudflare Worker (см. README.md, раздел 4) и впишите адрес в .env."
+            "ИИ не настроен: в .env нет AI_WORKER_URL. "
+            "Поднимите Cloudflare Worker (см. README.md, раздел 4) "
+            "и впишите его адрес в .env."
         )
-
-    fallback_models = [m for m in (models or ["gpt-4o", "gpt-3.5-turbo"]) if not str(m).startswith("@cf/")]
-    last_error = None
-    for model_name in fallback_models:
-        try:
-            response = g4f.ChatCompletion.create(model=model_name, messages=messages)
-            if response and str(response).strip():
-                return str(response).strip()
-        except Exception as e:  # g4f бросает что угодно
-            last_error = e
-    raise AIUnavailable(f"И g4f не смог ответить: {last_error}")
+    text, _ = client.chat_chain(messages, models=models, max_tokens=max_tokens, temperature=temperature)
+    return text

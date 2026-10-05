@@ -31,6 +31,24 @@ _SUMMARY_LEVELS = {
     4: "words_shortened",
 }
 
+# Парные обрамления: короткое описание не должно остаться с незакрытой скобкой.
+_BRACKET_PAIRS = {
+    "【": "】",
+    "(": ")",
+    "[": "]",
+    "{": "}",
+    "«": "»",
+}
+_OPENERS = "".join(_BRACKET_PAIRS)
+_CLOSERS = "".join(_BRACKET_PAIRS.values())
+
+# Одиночные декоративные знаки, которые выглядят оборванными в конце строки.
+_DANGLING_DECOR = "◈◆◇□■●○★☆✦✧▪▫"
+
+_EMPTY_BRACKETS_RE = re.compile(
+    r"(?:【\s*】|\(\s*\)|\[\s*\]|\{\s*\}|«\s*»)"
+)
+
 
 def _clean_summary_text(text, is_en=False):
     """Приводит summary к одной строке и убирает недопустимые символы для en."""
@@ -46,17 +64,132 @@ def _clean_summary_text(text, is_en=False):
 
 
 def _summary_fits(text, min_chars, max_chars, max_bytes):
+    """Оба лимита FunPay проверяются одновременно: символы и UTF-8 байты."""
     if not text or len(text) < min_chars or len(text) > max_chars:
         return False
     return max_bytes <= 0 or len(text.encode("utf-8")) <= max_bytes
 
 
-def _trim_decoration_edges(text):
-    """Убирает только декор по краям, не обрезая последнее слово."""
-    text = text.strip()
-    text = re.sub(r"^[^\w]+", "", text, flags=re.UNICODE)
-    text = re.sub(r"[^\w]+$", "", text, flags=re.UNICODE)
+def _is_emoji_char(char):
+    """Проверяет, что символ — основа эмодзи (без variation selector)."""
+    code = ord(char)
+    return (
+        0x1F000 <= code <= 0x1FAFF
+        or 0x1F1E6 <= code <= 0x1F1FF
+        or 0x2190 <= code <= 0x21FF
+        or 0x2300 <= code <= 0x23FF
+        or 0x2B00 <= code <= 0x2BFF
+        or 0x2600 <= code <= 0x27BF
+        or char in "©®™"
+    )
+
+
+def _ends_with_complete_unit(text):
+    """True, если строка не обрывается на «висячем» символе.
+
+    Недопустимый хвост: открывающая скобка, дефис, слэш, запятая, одиночный
+    variation selector (U+FE0F) и одинокий декоративный знак вроде ◈.
+    """
+    if not text:
+        return False
+    last = text[-1]
+    if last.isalnum() or last == "_":
+        return True
+    if last in _CLOSERS:
+        return True
+    if last in _DANGLING_DECOR:
+        return False
+    if _is_emoji_char(last):
+        return True
+    # Variation selector допустим только вместе с базовым эмодзи.
+    if last in "\ufe0f\ufe0e" and len(text) > 1 and _is_emoji_char(text[-2]):
+        return True
+    # Модификаторы цвета кожи — тоже часть кластера.
+    if "\U0001F3FB" <= last <= "\U0001F3FF" and len(text) > 1 and _is_emoji_char(text[-2]):
+        return True
+    return False
+
+
+def _trim_dangling_edges(text):
+    """Снимает только оборванные хвосты, не трогая целые слова и оформление."""
+    text = str(text or "").strip()
+    while text and not _ends_with_complete_unit(text):
+        text = text[:-1].rstrip()
     return text.strip()
+
+
+def _drop_unmatched_brackets(text):
+    """Убирает скобки без пары, чтобы не осталось незакрытых конструкций."""
+    stack = []
+    drop = set()
+    for index, char in enumerate(text):
+        if char in _OPENERS:
+            stack.append((index, char))
+        elif char in _CLOSERS:
+            if stack and _BRACKET_PAIRS[stack[-1][1]] == char:
+                stack.pop()
+            else:
+                drop.add(index)
+    for index, _ in stack:
+        drop.add(index)
+    if not drop:
+        return text
+    return "".join(char for index, char in enumerate(text) if index not in drop)
+
+
+def _read_emoji_cluster(text, start):
+    """Читает один эмодзи вместе с variation selector и модификатором."""
+    if start >= len(text) or not _is_emoji_char(text[start]):
+        return None, start
+    end = start + 1
+    while end < len(text) and text[end] in "\ufe0f\ufe0e\u200d":
+        end += 1
+        if end < len(text) and _is_emoji_char(text[end]) and text[end - 1] == "\u200d":
+            end += 1
+    while end < len(text) and "\U0001F3FB" <= text[end] <= "\U0001F3FF":
+        end += 1
+    return text[start:end], end
+
+
+def _collapse_repeated_emoji(text):
+    """Схлопывает повторы одного и того же эмодзи: «🟡 🟡» → «🟡».
+
+    После удаления бонуса или авто-выдачи по краям часто остаётся пара
+    одинаковых декоративных символов. Разное оформление шаблона не трогаем.
+    """
+    result = []
+    index = 0
+    length = len(text)
+    while index < length:
+        cluster, next_index = _read_emoji_cluster(text, index)
+        if cluster is None:
+            result.append(text[index])
+            index += 1
+            continue
+        result.append(cluster)
+        index = next_index
+        while index < length:
+            probe = index
+            while probe < length and text[probe] in " \t":
+                probe += 1
+            again, after = _read_emoji_cluster(text, probe)
+            if again is None or again != cluster:
+                break
+            index = after
+    return "".join(result)
+
+
+def _finalize_summary(text, is_en=False):
+    """Приводит кандидат к безопасному виду: баланс скобок и целые хвосты."""
+    cleaned = _clean_summary_text(text, is_en=is_en)
+    cleaned = _EMPTY_BRACKETS_RE.sub(" ", cleaned)
+    cleaned = _collapse_repeated_emoji(cleaned)
+    cleaned = _drop_unmatched_brackets(cleaned)
+    cleaned = _trim_dangling_edges(cleaned)
+    # Обрезка хвоста могла открыть висячую скобку — проверяем ещё раз.
+    cleaned = _drop_unmatched_brackets(cleaned)
+    cleaned = _trim_dangling_edges(cleaned)
+    return re.sub(r"\s+", " ", cleaned).strip()
 
 
 def _replace_title(text, title, replacement):
@@ -72,78 +205,83 @@ def _fallback_summary(is_en):
 
 
 def _fit_summary(text, title=None, is_en=False, min_chars=10, max_chars=70, max_bytes=120):
-    """Возвращает (подходящий summary, уровень сокращения)."""
-    original = _clean_summary_text(text, is_en=is_en)
-    current = original
-    level = 0
+    """Возвращает (подходящий summary, уровень сокращения).
 
-    if _summary_fits(current, min_chars, max_chars, max_bytes):
-        return current, level
+    Сначала собираются все осмысленные кандидаты: исходный заголовок, вариант
+    без бонуса, вариант без авто-выдачи, варианты с названием, сокращённым по
+    целым словам, и обрезка по целым словам. Ни один кандидат не режется
+    посимвольно и не режется по байтам, поэтому эмодзи-кластеры и U+FE0F не
+    рвутся. Из всех кандидатов выбирается самый длинный, который проходит
+    сразу оба лимита FunPay: 70 символов и 120 UTF-8 байт.
+    """
+    original = _clean_summary_text(text, is_en=is_en)
+    title_text = _clean_summary_text(title, is_en=is_en)
+
+    candidates = []  # (уровень сокращения, готовый вариант)
+
+    def _add(level, value):
+        ready = _finalize_summary(value, is_en=is_en)
+        if ready:
+            candidates.append((level, ready))
+
+    # Уровень 0: заголовок уже укладывается в лимиты.
+    _add(0, original)
 
     # Уровень 1: бонус за отзыв не помогает покупателю понять товар.
-    without_bonus = _clean_summary_text(_BONUS_RE.sub(" ", current), is_en=is_en)
-    if without_bonus != current:
-        current = without_bonus
-        level = 1
-    if _summary_fits(current, min_chars, max_chars, max_bytes):
-        return _trim_decoration_edges(current), level
+    without_bonus = _clean_summary_text(_BONUS_RE.sub(" ", original), is_en=is_en)
+    _add(1, without_bonus)
 
     # Уровень 2: авто-выдача уже подробно указана в описании лота.
-    without_delivery = _clean_summary_text(_AUTO_DELIVERY_RE.sub(" ", current), is_en=is_en)
-    if without_delivery != current:
-        current = without_delivery
-        level = max(level, 2)
-    if _summary_fits(current, min_chars, max_chars, max_bytes):
-        return _trim_decoration_edges(current), level
+    base = _clean_summary_text(_AUTO_DELIVERY_RE.sub(" ", without_bonus), is_en=is_en)
+    _add(2, base)
 
-    # Уровень 3: если передали название, постепенно оставляем только его
-    # первые слова. Целое слово всегда лучше обрыва по символам.
-    shortest_title_version = current
-    title_words = re.findall(r"\S+", str(title or "").strip())
+    # Уровень 3: название сокращается целыми словами, оформление остаётся.
+    title_words = title_text.split()
     if title_words:
         for word_count in range(len(title_words) - 1, 0, -1):
             short_title = " ".join(title_words[:word_count])
-            candidate = _clean_summary_text(
-                _replace_title(current, str(title).strip(), short_title),
-                is_en=is_en,
-            )
-            shortest_title_version = candidate
-            if _summary_fits(candidate, min_chars, max_chars, max_bytes):
-                return _trim_decoration_edges(candidate), 3
+            _add(3, _replace_title(base, title_text, short_title))
 
         # В сложном заголовке могут быть квадратные скобки, разные пробелы
         # или один очень длинный токен. Короткая нейтральная замена лучше,
         # чем разрыв такого слова.
-        short_title = "GUIDE" if is_en else "ГАЙД"
-        candidate = _clean_summary_text(
-            _replace_title(current, str(title).strip(), short_title),
-            is_en=is_en,
-        )
-        shortest_title_version = candidate
-        if _summary_fits(candidate, min_chars, max_chars, max_bytes):
-            return _trim_decoration_edges(candidate), 3
+        _add(3, _replace_title(base, title_text, "GUIDE" if is_en else "ГАЙД"))
 
-    # Уровень 4: оставляем самое длинное начало, состоящее из целых слов.
-    # Заголовки с декоративными символами по краям тоже не ломаются: декор
-    # снимается только после выбора целого слова.
-    for source in (shortest_title_version, current):
+    # Уровень 4: оставляем самые длинные начала из целых слов. Заголовки с
+    # декоративными символами по краям тоже не ломаются: декор снимается
+    # только после выбора целого слова.
+    for source in (base, without_bonus, original):
         words = source.split()
         for word_count in range(len(words), 0, -1):
-            candidate = _trim_decoration_edges(" ".join(words[:word_count]))
-            if _summary_fits(candidate, min_chars, max_chars, max_bytes):
-                return candidate, 4
+            _add(4, " ".join(words[:word_count]))
+
+    best = None
+    best_level = 4
+    best_key = None
+    for level, candidate in candidates:
+        if not _summary_fits(candidate, min_chars, max_chars, max_bytes):
+            continue
+        # Сначала менее агрессивный этап (бонус и авто-выдача убираются раньше
+        # названия), а внутри этапа — самый длинный полезный вариант.
+        key = (-level, len(candidate), -len(candidate.encode("utf-8")))
+        if best_key is None or key > best_key:
+            best, best_level, best_key = candidate, level, key
+
+    if best is not None:
+        return best, best_level
 
     # Даже одно слово может оказаться длиннее лимита. В таком случае
     # выбрасываем его целиком, а не режем посередине.
-    fallback = _fallback_summary(is_en)
-    return fallback, 4
+    return _fallback_summary(is_en), 4
 
 
 def fit_summary(text, title=None, is_en=False):
     """Осознанно укладывает заголовок в лимиты FunPay.
 
     Порядок сокращения: бонус → авто-выдача → название по словам →
-    общий обрез по целым словам. Функция не использует посимвольный срез.
+    общий обрез по целым словам. Функция не использует посимвольный срез
+    и не режет строку по байтам. Уровень сокращения пишется только в
+    logs/errors.log: в обычной консоли этого сообщения нет.
     """
     result, level = _fit_summary(
         text,
@@ -157,11 +295,12 @@ def fit_summary(text, title=None, is_en=False):
     if level:
         language = "en" if is_en else "ru"
         level_name = _SUMMARY_LEVELS[level]
+        source = _clean_summary_text(text, is_en=is_en)
         logger.info(
             "summary shortened: "
             f"language={language}, level={level_name}, "
-            f"chars={len(_clean_summary_text(text, is_en=is_en))}->{len(result)}, "
-            f"bytes={len(_clean_summary_text(text, is_en=is_en).encode('utf-8'))}->{len(result.encode('utf-8'))}"
+            f"chars={len(source)}->{len(result)}, "
+            f"bytes={len(source.encode('utf-8'))}->{len(result.encode('utf-8'))}"
         )
 
     return result

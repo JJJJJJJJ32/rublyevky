@@ -6,6 +6,11 @@ import string
 from config import LIMITS
 from modules.ai_generator import ai_translate_to_en
 from modules.description_builder import fit_summary
+from modules.logger import logger
+
+# Результаты публикации. «success» возвращается только если FunPay реально
+# принял лот: во всех остальных случаях товар считается невыставленным.
+RESULT_SUCCESS = "success"
 
 def truncate_to_bytes(text, max_bytes):
     """Обрезает текст до max_bytes в UTF-8, не разрывая многобайтовые символы
@@ -131,7 +136,7 @@ def publish_lot(session, game_data, short_description, full_description, payment
             or ("cloudflare" in body_low and len(resp.text) < 5000)
         )
         if cloudflare_challenge:
-            print(f"      🚫 Cloudflare заблокировал IP. Требуется пауза.")
+            logger.log_error("Cloudflare заблокировал IP при публикации лота")
             return "cloudflare_banned"
         
         soup = BeautifulSoup(resp.text, 'html.parser')
@@ -145,7 +150,7 @@ def publish_lot(session, game_data, short_description, full_description, payment
             if inp: csrf = inp.get('value')
         
         if not csrf:
-            print(f"      ❌ CSRF не найден — страница формы недоступна")
+            logger.log_error("CSRF не найден — страница формы лота недоступна")
             return "no_csrf"
 
         payload = {
@@ -178,16 +183,16 @@ def publish_lot(session, game_data, short_description, full_description, payment
         response = session.post(save_url, data=payload, headers={"X-Requested-With": "XMLHttpRequest", "Referer": edit_url}, timeout=30)
         result = response.json()
         if result.get('done'):
-            print(f"      ✅ УСПЕШНО ВЫСТАВЛЕНО!")
+            logger.info("Лот успешно выставлен")
             return "success"
         else:
             errors = result.get('errors')
-            print(f"      ❌ ОТКАЗ: {errors}")
+            logger.log_error(f"FunPay отклонил публикацию: {errors}")
             # Проверяем ошибку «Много предложений» — значит лимит категории исчерпан
             if errors:
                 err_str = str(errors).lower()
                 if any(kw in err_str for kw in ['много предложений', 'много лотов', 'too many', 'удалите ненужные', 'limit']):
-                    print(f"      ⚠️ Лимит лотов в категории исчерпан — переходим к следующей игре.")
+                    logger.info("Лимит лотов в категории исчерпан — переход к следующей игре")
                     return "limit_reached"
                 # Короткий английский текст — можно попробовать перезаполнить
                 if 'короткого английского' in err_str or 'too short' in err_str:
@@ -197,8 +202,8 @@ def publish_lot(session, game_data, short_description, full_description, payment
                     return "too_long_ru"
             return None
     except requests.exceptions.ConnectionError as e:
-        print(f"      ❌ ОШИБКА СЕТИ: {e}")
+        logger.log_error(f"Сетевая ошибка при публикации: {e}")
         return "network_error"
     except Exception as e:
-        print(f"      ❌ ОШИБКА publish_lot: {e}")
+        logger.log_error(f"Ошибка publish_lot: {e}")
         return None

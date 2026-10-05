@@ -21,7 +21,7 @@ from modules.description_builder import (
 )
 from modules.funpay_auth import get_session
 from modules.network import setup_network, recheck_network, get_proxy_url
-from modules.lot_publisher import publish_lot, get_category_info
+from modules.lot_publisher import publish_lot, get_category_info, RESULT_SUCCESS
 from modules.duplicate_checker import is_game_processed, mark_as_processed
 from modules.category_finder import find_funpay_category
 from modules.mandatory_products import select_mandatory_products
@@ -96,22 +96,44 @@ def build_final_ideas(game_name, ai_ideas, section_name=""):
 
 
 def _print_game_metrics(game_name, metrics):
+    """Тайминги и токены — только в logs/errors.log (в консоли при DEBUG_LOGS=1)."""
     total_seconds = time.perf_counter() - metrics["started"]
     requests_before, tokens_before = metrics["ai_before"]
     requests_after, tokens_after = ai_client.used_today()
     requests_delta = max(0, requests_after - requests_before)
     tokens_delta = max(0, tokens_after - tokens_before)
 
-    print(
-        f"⏱ [{game_name}] идеи: {metrics['ideas']:.1f} с | "
+    logger.info(
+        f"[{game_name}] идеи: {metrics['ideas']:.1f} с | "
         f"гайды: {metrics['guides']:.1f} с ({metrics['guide_count']} шт.) | "
         f"публикация: {metrics['publishing']:.1f} с ({metrics['publish_count']} лотов) | "
         f"вся игра: {total_seconds / 60:.1f} мин."
     )
-    print(
-        f"   [AI] За игру: запросов {requests_delta}, "
+    logger.info(
+        f"[{game_name}] За игру: запросов {requests_delta}, "
         f"токенов {tokens_delta} (по logs/ai_usage.jsonl)"
     )
+
+
+# Короткие причины, по которым лот не выставился. Успех печатается только
+# при результате «success»: всё остальное считается невыставленным товаром.
+_FAILURE_REASONS = {
+    "no_csrf": "не открылась форма лота",
+    "cloudflare_banned": "Cloudflare требует проверку",
+    "limit_reached": "лимит лотов в категории",
+    "too_short_en": "английское описание слишком короткое",
+    "too_long_ru": "русский текст слишком длинный",
+    "network_error": "сетевая ошибка",
+    None: "FunPay не ответил",
+}
+
+
+def _print_lot_status(index, total, ok, reason=None):
+    """Единственная строка по товару в обычной консоли."""
+    if ok:
+        print(f"[{index}/{total}] ✅ УСПЕШНО ВЫСТАВЛЕНО!")
+    else:
+        print(f"[{index}/{total}] ❌ НЕ ВЫСТАВЛЕНО: {reason or 'ошибка публикации'}")
 
 
 def process_single_game(session, game_data, net_session):
@@ -168,12 +190,12 @@ def process_single_game(session, game_data, net_session):
         content_pool = ThreadPoolExecutor(max_workers=2)
 
         for i, idea in enumerate(final_ideas):
-            print(f"📦 [{game_name}] {i + 1}/{len(final_ideas)}: {idea['title']}")
+            logger.debug(f"Товар {i + 1}/{len(final_ideas)}: {idea['title']}")
 
             if content_future is not None:
                 content, guide_seconds = content_future.result()
                 content_future = None
-                print("      ⚡ Берём заранее подготовленный гайд...")
+                logger.debug("Берём заранее подготовленный гайд")
             else:
                 content, guide_seconds = _generate_content_timed(idea, game_name)
             metrics["guides"] += guide_seconds
@@ -187,7 +209,8 @@ def process_single_game(session, game_data, net_session):
                 )
 
             if not content:
-                print("      ⚠️ Гайд не сгенерирован. Пропускаем товар.")
+                # Плохой гайд не публикуется.
+                _print_lot_status(i + 1, len(final_ideas), False, "гайд не сгенерирован")
                 continue
 
             file_name = f"{slugify(idea['title'][:30])}_{random.randint(100, 999)}.txt"
@@ -221,6 +244,9 @@ def process_single_game(session, game_data, net_session):
                 if not session:
                     logger.log_error("Cloudflare: не удалось авторизоваться после паузы")
                     return session, net_session
+                _print_lot_status(
+                    i + 1, len(final_ideas), False, _FAILURE_REASONS["cloudflare_banned"]
+                )
                 continue
 
             if result == "limit_reached":
@@ -230,23 +256,31 @@ def process_single_game(session, game_data, net_session):
                 return session, net_session
 
             if result == "too_short_en":
-                print("      ⚠️ Английский текст слишком короткий. Пропускаем товар.")
+                _print_lot_status(
+                    i + 1, len(final_ideas), False, _FAILURE_REASONS["too_short_en"]
+                )
                 continue
 
             if result == "too_long_ru":
-                print("      ⚠️ Русский текст слишком длинный. Пропускаем товар.")
+                _print_lot_status(
+                    i + 1, len(final_ideas), False, _FAILURE_REASONS["too_long_ru"]
+                )
                 continue
 
-            if result in ("no_csrf", None):
+            if result == RESULT_SUCCESS:
+                fail_count = 0
+                _print_lot_status(i + 1, len(final_ideas), True)
+            else:
                 fail_count += 1
+                _print_lot_status(
+                    i + 1, len(final_ideas), False, _FAILURE_REASONS.get(result)
+                )
                 logger.log_error(f"Публикация без ответа ({game_name}, товар {i + 1}): {result}")
                 if fail_count >= 3:
                     print("   [!] 3 неудачи подряд без ответа. Переходим к следующей игре.")
                     mark_as_processed(game_id)
                     remove_game_from_list(game_name)
                     return session, net_session
-            else:
-                fail_count = 0
 
             # В v18.4 была пауза 3–6 секунд. Длинная пауза 7–15 секунд
             # здесь не нужна: следующий гайд уже считается в фоне.
@@ -267,16 +301,19 @@ def process_single_game(session, game_data, net_session):
             metrics["publishing"] += time.perf_counter() - publish_started
             metrics["publish_count"] += 1
 
-            if wemod_result == "success":
-                print("      ✅ WeMod-лот выставлен.")
+            if wemod_result == RESULT_SUCCESS:
+                print("   💎 WeMod: ✅ ВЫСТАВЛЕНО")
             elif wemod_result == "limit_reached":
-                print("      ⚠️ Лимит лотов — WeMod пропущен.")
+                print("   💎 WeMod: ❌ НЕ ВЫСТАВЛЕНО: лимит лотов в категории")
             elif wemod_result == "cloudflare_banned":
                 print(f"      🚫 Cloudflare: пауза {config.CLOUDFLARE_PAUSE // 60} мин...")
                 time.sleep(config.CLOUDFLARE_PAUSE)
                 session = get_session(network_session=net_session, fresh=True)
             else:
-                print(f"      ⚠️ WeMod-лот не выставлен ({wemod_result}).")
+                print(
+                    "   💎 WeMod: ❌ НЕ ВЫСТАВЛЕНО: "
+                    f"{_FAILURE_REASONS.get(wemod_result, 'ошибка публикации')}"
+                )
                 logger.log_error(f"WeMod-лот не выставлен ({game_name}): {wemod_result}")
 
         mark_as_processed(game_id)

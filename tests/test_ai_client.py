@@ -65,6 +65,9 @@ class _Handler(BaseHTTPRequestHandler):
         length = int(self.headers.get("Content-Length") or 0)
         body = json.loads(self.rfile.read(length) or b"{}")
         self.server.last_request = body
+        if not hasattr(self.server, "requested_models"):
+            self.server.requested_models = []
+        self.server.requested_models.append(body.get("model"))
 
         if behaviour == "limit":
             self._send({"error": {"message": "дневной бесплатный лимит нейронов исчерпан", "type": "ai_limit_reached"}}, 429)
@@ -255,8 +258,14 @@ class TestSettings:
     def test_model_priority_default(self, monkeypatch):
         monkeypatch.delenv("AI_MODEL_PRIORITY", raising=False)
         models = ai_client.get_model_priority()
-        assert models[0] == "@cf/qwen/qwen3-30b-a3b-fp8"
-        assert "@cf/openai/gpt-oss-120b" in models
+        assert models == ["gemini-3.6-flash"]
+        assert not any(model.startswith("@cf/") for model in models)
+
+    def test_default_models_are_gemini_only(self):
+        """Рабочий сценарий — только Gemini через Worker, без @cf и без g4f."""
+        assert ai_client.DEFAULT_MODELS == ["gemini-3.6-flash"]
+        assert not any(model.startswith("@cf/") for model in ai_client.DEFAULT_MODELS)
+        assert not hasattr(ai_client, "_ask_g4f")
 
     def test_worker_url_strips_slash(self, monkeypatch):
         monkeypatch.setenv("AI_WORKER_URL", "https://example.workers.dev/")
@@ -283,3 +292,57 @@ class TestSettings:
         count, tokens = ai_client.used_today()
         assert count == 1
         assert tokens == 42
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# 5. Только Gemini через Worker
+# ═══════════════════════════════════════════════════════════════════════
+
+class TestGeminiOnly:
+
+    def test_gemini_priority_calls_only_gemini(self, monkeypatch, worker_url):
+        """AI_MODEL_PRIORITY=gemini-3.6-flash не должен звать @cf и g4f."""
+        url, server = worker_url
+        server.behaviour = "ok"
+        server.requested_models = []
+        monkeypatch.setenv("AI_MODEL_PRIORITY", "gemini-3.6-flash")
+        monkeypatch.setattr(
+            ai_client,
+            "client",
+            ai_client.AIClient(base_url=url, token="test-token", timeout=10),
+        )
+
+        text = ai_client.ai_ask([{"role": "user", "content": "привет"}])
+
+        assert "Тестовый гайд" in text
+        assert server.requested_models == ["gemini-3.6-flash"]
+
+    def test_single_model_limit_gives_clear_error(self, monkeypatch, worker_url):
+        """Единственная модель ответила лимитом — понятная ошибка, без подмены."""
+        url, server = worker_url
+        server.behaviour = "limit"
+        server.requested_models = []
+        monkeypatch.setattr(
+            ai_client,
+            "client",
+            ai_client.AIClient(base_url=url, token="test-token", timeout=10),
+        )
+
+        with pytest.raises(ai_client.AILimitReached) as error:
+            ai_client.ai_ask(
+                [{"role": "user", "content": "привет"}],
+                models=["gemini-3.6-flash"],
+            )
+
+        message = str(error.value)
+        assert "gemini-3.6-flash" in message
+        assert "лимит" in message.lower()
+        assert server.requested_models == ["gemini-3.6-flash"]
+
+    def test_missing_worker_does_not_fall_back_to_g4f(self, monkeypatch):
+        monkeypatch.setattr(
+            ai_client, "client", ai_client.AIClient(base_url="", token="")
+        )
+        with pytest.raises(ai_client.AIUnavailable) as error:
+            ai_client.ai_ask([{"role": "user", "content": "привет"}])
+        assert "AI_WORKER_URL" in str(error.value)

@@ -300,3 +300,50 @@ class TestConfigLimits:
     def test_emoji_bank_exists(self):
         import config
         assert len(config.EMOJI_BANK) > 0
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# 7. Тихий консольный вывод: только короткий итог по товару
+# ═══════════════════════════════════════════════════════════════════════
+
+class TestQuietConsole:
+
+    def test_success_prints_one_short_line(self, capsys):
+        import main
+
+        main._print_lot_status(7, 15, True)
+        output = capsys.readouterr().out
+        assert output.strip() == "[7/15] ✅ УСПЕШНО ВЫСТАВЛЕНО!"
+
+    def test_failure_prints_short_reason(self, capsys):
+        import main
+
+        main._print_lot_status(3, 15, False, "сетевая ошибка")
+        output = capsys.readouterr().out
+        assert output.strip() == "[3/15] ❌ НЕ ВЫСТАВЛЕНО: сетевая ошибка"
+
+    def test_failure_without_reason_stays_short(self, capsys):
+        import main
+
+        main._print_lot_status(1, 2, False)
+        output = capsys.readouterr().out
+        assert output.strip() == "[1/2] ❌ НЕ ВЫСТАВЛЕНО: ошибка публикации"
+
+    def test_every_failure_result_has_a_reason(self):
+        import main
+
+        for result in (
+            None, "no_csrf", "cloudflare_banned", "limit_reached",
+            "too_short_en", "too_long_ru", "network_error",
+        ):
+            assert result in main._FAILURE_REASONS, result
+
+    def test_success_is_never_a_failure_reason(self):
+        import main
+
+        assert "success" not in main._FAILURE_REASONS
+
+    def test_publish_lot_does_not_print_internal_messages(self):
+        """Внутренних сообщений о моделях, таймингах и summary в консоли нет."""
+        source = open("modules/lot_publisher.py", encoding="utf-8").read()
+        assert "print(" not in source
