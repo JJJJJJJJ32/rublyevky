@@ -441,7 +441,7 @@ def run_selftest():
 
 
 def main():
-    print("=== FUNPAY AUTO-BOT v19.5 (без Запрета, ИИ через Cloudflare Worker) ===\n")
+    print("=== FUNPAY AUTO-BOT v19.6 (без Запрета, ИИ через Cloudflare Worker) ===\n")
 
     net_session, net_ok = setup_network()
     if not net_ok:
