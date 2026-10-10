@@ -1,27 +1,70 @@
 import json
 import os
+import sys
 import logging
 from datetime import datetime
 
+# Переменные, включающие подробный вывод в консоль.
+# DEBUG_LOGS=1 (или DEBUG=1) показывает тайминги, модели, уровни сокращения
+# и прочие внутренние сообщения. Без них в консоли только короткий итог.
+DEBUG_ENV_VARS = ("DEBUG_LOGS", "DEBUG")
+
+
+def debug_enabled():
+    """Включён ли подробный вывод в консоль."""
+    for name in DEBUG_ENV_VARS:
+        raw = (os.getenv(name) or "").strip().lower()
+        if raw in ("1", "true", "yes", "on", "debug", "verbose"):
+            return True
+    return False
+
+
 class BotLogger:
-    def __init__(self, log_file="data/bot_log.json", error_log="logs/errors.log"):
+    def __init__(self, log_file="data/bot_log.json", error_log="logs/errors.log", debug=None):
         self.log_file = log_file
         self.error_log = error_log
-        
+        # В обычном режиме внутренние сообщения не показываются: они всегда
+        # уходят в logs/errors.log, а в консоль — только при DEBUG_LOGS=1.
+        self.debug_mode = debug_enabled() if debug is None else bool(debug)
+
         # Создаем необходимые папки, если их нет
         os.makedirs("data", exist_ok=True)
         os.makedirs("logs", exist_ok=True)
         os.makedirs("generated_content", exist_ok=True)
-        
+
         self._setup_standard_logging()
         self._init_json_log()
 
     def _setup_standard_logging(self):
-        logging.basicConfig(
-            filename=self.error_log,
-            level=logging.ERROR,
-            format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+        """Файл всегда, консоль — только в режиме отладки."""
+        # У каждого экземпляра свой логгер: тесты и основной бот не мешают
+        # друг другу обработчиками.
+        self._logger = logging.getLogger(f"funpay_bot_{id(self):x}")
+        self._logger.setLevel(logging.DEBUG)
+        self._logger.propagate = False
+        for handler in list(self._logger.handlers):
+            self._logger.removeHandler(handler)
+            try:
+                handler.close()
+            except Exception:
+                pass
+
+        file_handler = logging.FileHandler(self.error_log, encoding="utf-8")
+        file_handler.setLevel(logging.DEBUG)
+        file_handler.setFormatter(
+            logging.Formatter("%(asctime)s - funpay_bot - %(levelname)s - %(message)s")
         )
+        self._logger.addHandler(file_handler)
+
+        if self.debug_mode:
+            console_handler = logging.StreamHandler(sys.stdout)
+            console_handler.setLevel(logging.DEBUG)
+            console_handler.setFormatter(
+                logging.Formatter(
+                    "[%(asctime)s] %(levelname)s: %(message)s", datefmt="%H:%M:%S"
+                )
+            )
+            self._logger.addHandler(console_handler)
 
     def _init_json_log(self):
         if not os.path.exists(self.log_file):
@@ -54,13 +97,23 @@ class BotLogger:
         self._save_json(data)
 
     def log_error(self, error_msg):
-        logging.error(error_msg)
-        data = self._load_json()
-        data["statistics"]["total_errors"] += 1
-        data["statistics"]["last_activity"] = datetime.now().isoformat()
-        self._save_json(data)
+        """Ошибка: файл errors.log + счётчик статистики. В консоль — только DEBUG."""
+        self._logger.error(str(error_msg))
+        try:
+            data = self._load_json()
+            data["statistics"]["total_errors"] += 1
+            data["statistics"]["last_activity"] = datetime.now().isoformat()
+            self._save_json(data)
+        except (OSError, ValueError):
+            pass  # логи не должны ломать работу
 
     def info(self, message):
-        print(f"[{datetime.now().strftime('%H:%M:%S')}] INFO: {message}")
+        """Внутренняя техническая информация: только файл, консоль — при DEBUG."""
+        self._logger.info(str(message))
+
+    def debug(self, message):
+        """Отладочная деталь: файл всегда, консоль — при DEBUG."""
+        self._logger.debug(str(message))
+
 
 logger = BotLogger()

@@ -1,9 +1,11 @@
 """
 modules/ai_generator.py — генерация гайдов и переводов.
 
-Логика качества осталась прежней (детектор отказов ИИ, проверка длины,
-дописывание коротких гайдов), но обращения к ИИ идут через modules/ai_client.py:
-в твой Cloudflare Worker, а не в библиотеку g4f.
+Логика качества: детектор отказов ИИ, проверка длины, доли списков и повторов,
+пост-проверка связи гайда с игрой и товаром, дописывание коротких гайдов.
+Обращения к ИИ идут через modules/ai_client.py — в твой Cloudflare Worker,
+а не в библиотеку g4f. Внутренние сообщения пишутся только в logs/errors.log:
+в обычной консоли остаётся короткий итог по товару.
 """
 
 import json
@@ -53,6 +55,36 @@ _LIST_LINE_RE = re.compile(r"^\s*(?:[-•*]\s*|\d+\s*[.)]\s+)")
 MIN_WORDS = 400
 MIN_CHARS = 2000
 
+# Слова, которые не говорят ни об игре, ни о товаре: по ним нельзя понять,
+# что гайд именно про нужную тему.
+_GENERIC_WORDS = {
+    "гайд", "гайда", "гайды", "гайдом", "игр", "игра", "игры", "игре", "игру",
+    "игрой", "руководство", "инструкция", "мануал", "способ", "способы",
+    "товар", "товара", "полное", "полный", "подробный", "простой",
+    "game", "games", "guide", "guides", "manual", "tips", "tricks",
+    "best", "full", "complete", "how", "the", "and", "for", "with",
+    "your", "you", "from", "that", "this",
+}
+
+# Художественное вступление вместо конкретного действия или настройки.
+_ARTISTIC_INTRO_RE = re.compile(
+    r"^\s*(?:"
+    r"представь(?:те)?\b"
+    r"|вообрази(?:те)?\b"
+    r"|давай(?:те)?\s+представим"
+    r"|когда-то\b"
+    r"|однажды\b"
+    r"|давным-давно\b"
+    r"|в\s+тишине\b"
+    r"|под\s+шум\b"
+    r"|imagine\b"
+    r"|picture\s+this\b"
+    r"|once\s+upon\s+a\s+time\b"
+    r"|let\s+me\s+tell\s+you\b"
+    r")",
+    re.IGNORECASE,
+)
+
 
 def _is_refused(text):
     """Проверяет не отказался ли ИИ или не выдал ли себя."""
@@ -72,6 +104,81 @@ def _is_list_heavy(text, threshold=0.4):
         return False
     list_lines = sum(bool(_LIST_LINE_RE.match(line)) for line in lines)
     return list_lines / len(lines) > threshold
+
+
+def _is_repetitive(text, threshold=0.45):
+    """True, если одна и та же мысль повторяется разными словами.
+
+    Считаем долю повторяющихся пятисловных связок: общий текст без игровых
+    деталей обычно крутит одну и ту же фразу.
+    """
+    words = re.findall(r"[A-Za-zА-Яа-яЁё0-9']+", str(text or "").lower())
+    if len(words) < 40:
+        return False
+    total = len(words) - 4
+    if total <= 0:
+        return False
+    unique = len({" ".join(words[index:index + 5]) for index in range(total)})
+    return (total - unique) / total > threshold
+
+
+def _guide_keywords(game_name, title, content_points):
+    """Ключевые слова, по которым видно связь гайда с игрой и товаром."""
+    parts = [str(game_name or ""), str(title or "")]
+    parts.extend(str(point) for point in (content_points or []))
+    keywords = []
+    for part in parts:
+        for word in re.findall(r"[A-Za-zА-Яа-яЁё][A-Za-zА-Яа-яЁё0-9\-']*", part):
+            low = word.lower().strip("-'")
+            if len(low) < 4 or low in _GENERIC_WORDS:
+                continue
+            if low not in keywords:
+                keywords.append(low)
+    return keywords
+
+
+def _game_name_forms(game_name):
+    """Название игры и его значимые части в нижнем регистре."""
+    name = re.sub(r"[^\w\s]", " ", str(game_name or "").lower())
+    words = [word for word in name.split() if len(word) >= 4 and word not in _GENERIC_WORDS]
+    forms = []
+    if words:
+        forms.append(" ".join(words))
+        forms.append(words[0])
+    return forms
+
+
+def _is_guide_relevant(text, game_name=None, title=None, content_points=None):
+    """Проверяет, что гайд про эту игру и этот товар, а не общий текст.
+
+    Отбраковываются художественное вступление, выдуманные сцены без связи
+    с игрой, текст с повторами и текст, в котором нет ключевых слов темы.
+    """
+    if not text:
+        return False
+
+    low = str(text).lower()
+    intro = low[:300]
+
+    # Художественное вступление вместо конкретного действия или настройки.
+    if _ARTISTIC_INTRO_RE.search(intro):
+        return False
+
+    if _is_repetitive(text):
+        return False
+
+    keywords = _guide_keywords(game_name, title, content_points)
+    if not keywords:
+        return True
+
+    hits = sum(1 for keyword in keywords if keyword in low)
+    game_mentioned = any(form in low for form in _game_name_forms(game_name))
+
+    if game_mentioned and hits >= 1:
+        return True
+    if hits >= 3:
+        return True
+    return hits >= 2 and len(text) >= MIN_CHARS
 
 
 def _is_guide_good(text):
@@ -182,18 +289,17 @@ def _postprocess_guide(text):
 
 def _ask(messages, max_tokens=None, temperature=None):
     """
-    Единая обёртка над ИИ. Ошибки не молчат — их видно в консоли и в логе.
+    Единая обёртка над ИИ. Ошибки не молчат — их видно в logs/errors.log,
+    а в консоли остаётся только короткий итог по товару.
     """
     try:
         return ai_client.ai_ask(messages, max_tokens=max_tokens, temperature=temperature)
     except ai_client.AILimitReached:
         raise  # дневной лимит — наверху решают, ждать или остановиться
     except ai_client.AIError as e:
-        print(f"      [AI] ⚠️ {e}")
         logger.log_error(f"ИИ недоступен: {e}")
         return None
     except Exception as e:
-        print(f"      [AI] ⚠️ Неожиданная ошибка ИИ: {e}")
         logger.log_error(f"ИИ: неожиданная ошибка {e}")
         return None
 
@@ -229,7 +335,7 @@ def ai_generate_product_ideas(game_name):
 ]"""
 
     for attempt in range(2):
-        print(f"   [AI] Генерируем идеи товаров (попытка {attempt + 1}/2)...")
+        logger.info(f"Генерация идей товаров: попытка {attempt + 1}/2")
         response = _ask([{"role": "user", "content": prompt}], max_tokens=1800)
         if not response:
             continue
@@ -239,10 +345,10 @@ def ai_generate_product_ideas(game_name):
                 data = json.loads(match.group(0))
                 if len(data) >= 5:
                     return data
-                print(f"      [AI] Идей мало ({len(data)}), пробуем ещё раз...")
+                logger.info(f"Идей мало ({len(data)}), пробуем ещё раз")
             except ValueError:
-                print("      [AI] Ответ не разобрался как JSON, пробуем ещё раз...")
-    print("   [AI] ⚠️ Идеи получить не удалось — будут только обязательные товары.")
+                logger.info("Ответ не разобрался как JSON, пробуем ещё раз")
+    logger.info("Идеи получить не удалось — будут только обязательные товары")
     return []
 
 
@@ -256,7 +362,9 @@ def ai_generate_full_content(idea, game_name):
 
     prompt_main = f"""Напиши подробный гайд на РУССКОМ ЯЗЫКЕ по теме «{title}» для игры «{game_name}».
 Нужно примерно 700–900 слов, но не растягивай текст пустыми фразами. Начни сразу с
-конкретного действия или ситуации в игре, без вступления о том, что сейчас будет рассказано.
+конкретного действия или настройки: что открыть, куда пойти, что включить или выключить.
+Для темы про оптимизацию ПК начни с конкретных настроек игры, Windows, драйвера или
+видеокарты, а не с истории. В первом же предложении назови игру «{game_name}».
 
 Пиши как игрок, который сам проверил советы. Нужны названия предметов, локаций,
 персонажей, режимов и точные ориентиры: количество, время, порядок действий,
@@ -275,7 +383,13 @@ def ai_generate_full_content(idea, game_name):
 Если исходная тема звучит спорно, преврати её в практическую настройку ПК или игровую
 оптимизацию и продолжай без объяснений о смене темы.
 
-Текст должен звучать как полезный авторский разбор, а не как рекламный шаблон."""
+Запрещено придумывать выдуманные сцены: деревни, леса, силуэты, героев и события,
+которых нет в теме товара. Не пиши общий текст про «мир игр» и не повторяй одну мысль
+разными словами. Каждый абзац должен давать практический шаг, проверяемую деталь
+или условие, связанные с «{game_name}» и темой «{title}».
+
+Текст должен звучать как полезный авторский разбор, а не как рекламный шаблон.
+"""
 
     prompt_continue = (
         "Продолжи гайд ещё минимум на 400 слов. Дай новые конкретные игровые детали, "
@@ -284,11 +398,12 @@ def ai_generate_full_content(idea, game_name):
         "фраз «В заключение», «Итоги», «Вывод», «Таким образом», «Важно отметить» или "
         "«Не забывайте».")
 
-    prompt_alt = f"""Представь, что ты опытный игрок, который объясняет товарищу рабочий способ по теме
-«{title}» в игре «{game_name}». Напиши живой подробный текст на русском языке объёмом
+    prompt_alt = f"""Опиши рабочий способ по теме «{title}» в игре «{game_name}» так, как объяснил бы
+его опытный игрок товарищу. Напиши живой подробный текст на русском языке объёмом
 не меньше 600 слов. Начни с конкретной игровой ситуации: куда идти, что выбрать или
 какую ошибку исправить. Добавь проверяемые детали — названия, числа, время, расстояния,
-условия и порядок действий.
+условия и порядок действий. Не начинай с фраз «Представь, что ты» и не сочиняй сказочных
+сцен: только то, что реально относится к «{game_name}» и теме «{title}».
 
 Не используй фиксированный шаблон «введение — три пункта — советы — итоги». Пусть часть
 текста идёт связными абзацами, а короткая нумерация появляется только там, где она
@@ -298,20 +413,45 @@ def ai_generate_full_content(idea, game_name):
 Не используй Markdown-заголовки вида ##, ряды эмодзи-буллитов и канцелярские клише:
 «В заключение», «Итоги», «Вывод», «Подводя итог», «Таким образом», «В этой статье»,
 «В этом гайде я расскажу», «Важно отметить», «Стоит отметить», «Не забывайте».
-Не упоминай ИИ и не пиши отказов. Сразу дай полезный материал, без мета-вступления."""
+Не упоминай ИИ и не пиши отказов. Сразу дай полезный материал, без мета-вступления.
+"""
+
+    prompt_strict = f"""Пиши строго по делу и только про игру «{game_name}» и тему «{title}».
+Начало текста — сразу конкретное действие или настройка без всякого вступления.
+В первом предложении обязательно упомяни «{game_name}».
+
+Обязательно используй реальные игровые детали этой темы: названия предметов, локаций,
+персонажей, режимов, настройек, пунктов меню или механик, а для темы про ПК — настройки
+игры, Windows, драйвера или видеокарты. Дай практические шаги с числами, условиями
+и порядком действий.
+
+Категорически запрещено:
+- художественное вступление, выдуманные сцены, деревни, леса, герои и события вне темы;
+- общие фразы про «мир игр» и повторы одной мысли разными словами;
+- мета-фразы про ИИ, статью или генерацию текста;
+- финальные разделы «Итоги», «Вывод», «Заключение» и Markdown-заголовки ##;
+- превращать весь текст в список: обычных абзацев должно быть больше.
+
+Объём — не меньше 600 слов. Плохой общий текст без связи с игрой будет отбракован."""
 
     def _accept(response, stage):
-        """Общая проверка ответа: очистка, отказ, длина и доля списков."""
+        """Общая проверка ответа: очистка, отказ, длина, списки и связь с игрой."""
         if not response or len(response) < 100:
             return None
         cleaned = _postprocess_guide(response)
         if not cleaned or len(cleaned) < 100:
+            logger.info(f"Гайд после очистки слишком короткий ({stage})")
             return None
         if _is_refused(cleaned):
-            print(f"      [AI] ⚠️ Отказ или упоминание ИИ ({stage}). Пробуем иначе...")
+            logger.info(f"Гайд отклонён: отказ или упоминание ИИ ({stage})")
             return None
         if _is_list_heavy(cleaned):
-            print(f"      [AI] ⚠️ Слишком много строк-списков ({stage}). Пробуем иначе...")
+            logger.info(f"Гайд отклонён: слишком много строк-списков ({stage})")
+            return None
+        if not _is_guide_relevant(
+            cleaned, game_name, title, idea.get("content_points")
+        ):
+            logger.info(f"Гайд отклонён: нет связи с игрой или товаром ({stage})")
             return None
         return cleaned
 
@@ -325,7 +465,7 @@ def ai_generate_full_content(idea, game_name):
         if _is_guide_good(result):
             return result
         if len(result) > 200:
-            print(f"      [AI] Гайд короткий ({_count_words(result)} слов). Просим дописать...")
+            logger.info(f"Гайд короткий ({_count_words(result)} слов). Просим дописать")
             more = _accept(
                 _ask([
                     {"role": "user", "content": prompt_main},
@@ -339,13 +479,13 @@ def ai_generate_full_content(idea, game_name):
                 if _is_guide_good(result):
                     return result
         if len(result) > 500 and _usable(result):
-            print(f"      [AI] Гайд получен ({_count_words(result)} слов).")
+            logger.info(f"Гайд получен ({_count_words(result)} слов)")
             return result
 
     # === ПОПЫТКА 2: другой промпт ===
     result = _accept(_ask([{"role": "user", "content": prompt_alt}], max_tokens=3000), "альтернативный промпт")
     if result and len(result) > 500 and _usable(result):
-        print(f"      [AI] Гайд получен через альт. промпт ({_count_words(result)} слов).")
+        logger.info(f"Гайд получен через альт. промпт ({_count_words(result)} слов)")
         return result
 
     # === ПОПЫТКА 3: повтор основного промпта (модель может ответить иначе) ===
@@ -355,10 +495,21 @@ def ai_generate_full_content(idea, game_name):
         if _is_guide_good(result):
             return result
         if len(result) > 500 and _usable(result):
-            print(f"      [AI] Гайд получен ({_count_words(result)} слов).")
+            logger.info(f"Гайд получен ({_count_words(result)} слов)")
             return result
 
-    print("      ⚠️ Все попытки ИИ провалились. Пропускаем товар.")
+    # === ПОПЫТКА 4: самый строгий промпт — только конкретика по игре ===
+    time.sleep(2)
+    result = _accept(_ask([{"role": "user", "content": prompt_strict}], max_tokens=3000), "строгий промпт")
+    if result:
+        if _is_guide_good(result):
+            return result
+        if len(result) > 500 and _usable(result):
+            logger.info(f"Гайд получен через строгий промпт ({_count_words(result)} слов)")
+            return result
+
+    # Плохой гайд не публикуется: товар будет пропущен.
+    logger.info("Все попытки ИИ провалились. Товар пропущен")
     return None
 
 
