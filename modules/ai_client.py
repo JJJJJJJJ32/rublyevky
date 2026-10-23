@@ -21,6 +21,7 @@ modules/ai_client.py — единый клиент ИИ через Cloudflare Wo
 
 import json
 import os
+import re
 import threading
 import time
 from datetime import datetime
@@ -57,6 +58,14 @@ class AILimitReached(AIError):
 
 class AIUnavailable(AIError):
     """Worker недоступен: нет URL, токен не принят, сеть, 5xx."""
+
+
+class AIModelNotSupported(AIError):
+    """Worker не знает такую модель: устарел Worker или опечатка в AI_MODEL_PRIORITY."""
+
+    def __init__(self, message, available=None):
+        super().__init__(message)
+        self.available = [str(model) for model in (available or [])]
 
 
 def get_worker_url():
@@ -142,6 +151,34 @@ class AIClient:
 
         return True, data
 
+    def supported_models(self):
+        """Список моделей, которые знает Worker (пусто, если Worker не ответил).
+
+        Актуальный Worker отдаёт /v1/models, старый — только /health с полем
+        models. Если Worker не отвечает или не сообщает список, возвращаем []:
+        это не ошибка, просто проверить нечем.
+        """
+        if not self.configured:
+            return []
+        try:
+            resp = self.session.get(self._url("/v1/models"), headers=self._headers(), timeout=30)
+            if resp.status_code == 200:
+                data = resp.json()
+                models = [
+                    str(item.get("id"))
+                    for item in (data.get("data") or [])
+                    if isinstance(item, dict) and item.get("id")
+                ]
+                if models:
+                    return models
+        except Exception:
+            pass  # Worker старый или недоступен — проверяем через /health
+
+        ok, info = self.health()
+        if ok and isinstance(info, dict):
+            return [str(model) for model in (info.get("models") or []) if model]
+        return []
+
     # ─── Основной метод ────────────────────────────────────────────────
 
     def chat(self, messages, model=None, max_tokens=None, temperature=None, attempts=None):
@@ -185,7 +222,7 @@ class AIClient:
                     if resp.status_code >= 500:
                         raise AIUnavailable(f"Worker вернул {resp.status_code}: {_extract_error(resp)}")
                     if resp.status_code != 200:
-                        last_error = AIError(f"{model_name}: статус {resp.status_code} — {_extract_error(resp)}")
+                        last_error = _model_error(model_name, resp.status_code, _extract_error(resp))
                         break  # смысла повторять ту же модель нет, идём к следующей
 
                     data = resp.json()
@@ -258,6 +295,22 @@ class AIClient:
 
 
 # ─── Вспомогательные ───────────────────────────────────────────────────
+
+def _available_from_error(error_text):
+    """Достаёт список моделей из ответа Worker'а «Доступные: a, b, c»."""
+    match = re.search(r"доступные\s*:\s*(.+)$", str(error_text or ""), re.IGNORECASE | re.DOTALL)
+    if not match:
+        return []
+    return [item.strip() for item in match.group(1).split(",") if item.strip()]
+
+
+def _model_error(model_name, status, error_text):
+    """Понятная ошибка, если Worker не знает запрошенную модель."""
+    if status == 400 and "не поддерживает" in str(error_text or "").lower():
+        available = _available_from_error(error_text)
+        return AIModelNotSupported(f"{model_name}: {error_text}", available)
+    return AIError(f"{model_name}: статус {status} — {error_text}")
+
 
 def _short_network_error(exc):
     """Короткое объяснение сетевой проблемы вместо многоэтажного текста requests."""
@@ -349,6 +402,25 @@ def used_today():
     except OSError:
         pass
     return count, tokens
+
+
+def check_model_support(models=None):
+    """Проверяет, что Worker знает все модели из цепочки.
+
+    Возвращает (неподдерживаемые, доступные). Пустой список доступных моделей
+    значит, что Worker не сообщил свой список (старая версия) — тогда
+    предупреждать нечем и проверка считается пройденной.
+    """
+    chain = list(models or get_model_priority())
+    available = client.supported_models()
+    if not available:
+        return [], []
+
+    def _known(model):
+        name = str(model)
+        return name in available or name.startswith("openrouter/")
+
+    return [model for model in chain if not _known(model)], available
 
 
 # ─── Общая точка входа ─────────────────────────────────────────────────
