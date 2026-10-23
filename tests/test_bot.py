@@ -27,6 +27,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 
 from modules.lot_publisher import enforce_limits, truncate_to_bytes
 from modules.ai_generator import _is_refused, _count_words, _is_guide_good, MIN_WORDS, MIN_CHARS
+import main as bot_main
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -347,3 +348,100 @@ class TestQuietConsole:
         """Внутренних сообщений о моделях, таймингах и summary в консоли нет."""
         source = open("modules/lot_publisher.py", encoding="utf-8").read()
         assert "print(" not in source
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# 8. Сбой ИИ не должен стирать список игр
+# ═══════════════════════════════════════════════════════════════════════
+
+class _FakeGameData(dict):
+    """Минимальные данные игры, которые нужны process_single_game."""
+
+
+def _run_game_without_guides(monkeypatch, capsys):
+    """
+    Прогоняет одну игру, где ИИ не отдал ни одного гайда.
+    Возвращает (removed_games, marked_games).
+    """
+    removed = []
+    marked = []
+
+    monkeypatch.setattr(bot_main, "_generate_ideas_timed", lambda name: ([], 0.01))
+    monkeypatch.setattr(bot_main, "_generate_content_timed", lambda idea, game: (None, 0.01))
+    monkeypatch.setattr(
+        bot_main,
+        "find_funpay_category",
+        lambda session, name: {"id": 42, "type": "games", "game_id": 42},
+    )
+    monkeypatch.setattr(bot_main, "get_category_info", lambda session, game_id: "Games")
+    monkeypatch.setattr(bot_main, "is_game_processed", lambda game_id: False)
+    monkeypatch.setattr(bot_main, "build_final_ideas", lambda *a, **k: [{"title": "PC Optimization"}])
+    monkeypatch.setattr(bot_main.gdrive, "create_folder", lambda name: "folder-id")
+    monkeypatch.setattr(bot_main, "remove_game_from_list", lambda name: removed.append(name))
+    monkeypatch.setattr(bot_main, "mark_as_processed", lambda game_id: marked.append(game_id))
+    monkeypatch.setattr(
+        bot_main,
+        "check_wemod_availability",
+        lambda name: (_ for _ in ()).throw(AssertionError("WeMod не должен запускаться")),
+    )
+    monkeypatch.setattr(bot_main, "_publish_with_heal", lambda *a, **k: ("success", None, None))
+    monkeypatch.setattr(bot_main.time, "sleep", lambda seconds: None)
+
+    result = bot_main.process_single_game(
+        session=object(),
+        game_data=_FakeGameData({"game_name": "Some Game"}),
+        net_session=object(),
+    )
+    captured = capsys.readouterr()
+    return removed, marked, result, captured.out
+
+
+class TestAiOutageKeepsGamesList:
+
+    def test_game_is_not_removed_when_no_guides(self, monkeypatch, capsys):
+        removed, marked, result, output = _run_game_without_guides(monkeypatch, capsys)
+
+        assert removed == [], "игру нельзя убирать из списка, пока ИИ не выдал гайды"
+        assert marked == [], "игру нельзя помечать обработанной без гайдов"
+        assert "остаётся в списке" in output
+        assert "УСПЕШНО ВЫСТАВЛЕНО" not in output
+
+    def test_nothing_is_published_without_guides(self, monkeypatch, capsys):
+        published = []
+
+        def _publish(session, net_session, game_id, short, full, pay_msg, price, **kwargs):
+            published.append(game_id)
+            return "success", session, net_session
+
+        monkeypatch.setattr(bot_main, "_publish_with_heal", _publish)
+        _run_game_without_guides(monkeypatch, capsys)
+        assert published == []
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# 9. Проверка модели перед началом работы (Worker должен её знать)
+# ═══════════════════════════════════════════════════════════════════════
+
+class TestPreflightAi:
+
+    def test_unknown_model_returns_false(self, monkeypatch, capsys):
+        monkeypatch.setattr(
+            bot_main.ai_client,
+            "check_model_support",
+            lambda models=None: (["gemini-3.6-flash"], ["gemini-2.5-flash"]),
+        )
+        monkeypatch.setattr(bot_main.time, "sleep", lambda seconds: None)
+
+        assert bot_main._preflight_ai() is False
+        output = capsys.readouterr().out
+        assert "не знает модель" in output
+        assert "wrangler deploy" in output
+
+    def test_known_model_returns_true(self, monkeypatch):
+        monkeypatch.setattr(bot_main.ai_client, "check_model_support", lambda models=None: ([], ["gemini-3.6-flash"]))
+        assert bot_main._preflight_ai() is True
+
+    def test_silent_worker_returns_true(self, monkeypatch):
+        """Старый Worker без списка моделей не должен блокировать запуск."""
+        monkeypatch.setattr(bot_main.ai_client, "check_model_support", lambda models=None: ([], []))
+        assert bot_main._preflight_ai() is True

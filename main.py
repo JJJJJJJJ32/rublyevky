@@ -184,6 +184,7 @@ def process_single_game(session, game_data, net_session):
             return session, net_session
 
         fail_count = 0
+        guide_success = 0
         # В фоне готовится только следующий гайд. Пока он считается, текущий
         # файл загружается и лот публикуется. Так мы не создаём большой поток
         # запросов и не упираемся в лимит Worker'а.
@@ -212,6 +213,8 @@ def process_single_game(session, game_data, net_session):
                 # Плохой гайд не публикуется.
                 _print_lot_status(i + 1, len(final_ideas), False, "гайд не сгенерирован")
                 continue
+
+            guide_success += 1
 
             file_name = f"{slugify(idea['title'][:30])}_{random.randint(100, 999)}.txt"
             file_path = os.path.join(config.GENERATED_CONTENT_DIR, file_name)
@@ -285,6 +288,13 @@ def process_single_game(session, game_data, net_session):
             # В v18.4 была пауза 3–6 секунд. Длинная пауза 7–15 секунд
             # здесь не нужна: следующий гайд уже считается в фоне.
             time.sleep(random.randint(3, 6))
+
+        if guide_success == 0:
+            # ИИ не выдал ни одного гайда (лимит, устаревший Worker, отказы).
+            # Игру не трогаем: иначе пустой список игр съестся за один круг.
+            print(f"   [!] Ни один гайд не сгенерирован для «{game_name}». Игра остаётся в списке.")
+            logger.log_error(f"Ни один гайд не сгенерирован для {game_name} — игра остаётся в списке")
+            return session, net_session
 
         if check_wemod_availability(game_name):
             print("💎 СОЗДАНИЕ WEMOD...")
@@ -384,6 +394,23 @@ def run_selftest():
             print(f"   ❌ {info}")
             problems.append(f"Worker: {info}")
 
+        # Модель из AI_MODEL_PRIORITY должна быть известна Worker'у.
+        missing, available = ai_client.check_model_support()
+        if available and missing:
+            print(f"   ❌ Worker не знает модель(и): {', '.join(str(m) for m in missing)}")
+            print(f"      Доступные у Worker'а: {', '.join(str(m) for m in available)}")
+            print(
+                "      Обнови Worker (cd worker; npx --yes wrangler deploy) "
+                "или поправь AI_MODEL_PRIORITY в .env"
+            )
+            problems.append(f"Worker не знает модель {', '.join(str(m) for m in missing)}")
+        elif available:
+            print(
+                "   • модель "
+                + ", ".join(str(m) for m in ai_client.get_model_priority())
+                + ": ✅ поддерживается Worker'ом"
+            )
+
         print("\n   Пробуем сгенерировать тестовый текст...")
         try:
             text = ai_client.ai_ask(
@@ -440,8 +467,32 @@ def run_selftest():
     return not problems
 
 
+def _preflight_ai():
+    """Проверяет до старта, что Worker знает модель из AI_MODEL_PRIORITY.
+
+    Если Worker устарел и не знает модель, бот не начинает перебирать игры:
+    он печатает понятную подсказку и ждёт, пока Worker обновят.
+    """
+    missing, available = ai_client.check_model_support()
+    if available and missing:
+        print("   [!] Worker не знает модель(и): " + ", ".join(str(m) for m in missing))
+        print("       Доступные у Worker'а: " + ", ".join(str(m) for m in available))
+        print(
+            "       Обнови Worker (cd worker; npx --yes wrangler deploy) "
+            "или поправь AI_MODEL_PRIORITY в .env"
+        )
+        logger.log_error(f"Worker не знает модель {missing}. Доступные: {available}")
+        return False
+    if available:
+        logger.info(
+            "Worker знает модели из цепочки: "
+            + ", ".join(str(m) for m in ai_client.get_model_priority())
+        )
+    return True
+
+
 def main():
-    print("=== FUNPAY AUTO-BOT v19.6 (без Запрета, ИИ через Cloudflare Worker) ===\n")
+    print("=== FUNPAY AUTO-BOT v19.7 (без Запрета, ИИ через Cloudflare Worker) ===\n")
 
     net_session, net_ok = setup_network()
     if not net_ok:
@@ -450,6 +501,11 @@ def main():
 
     while True:
         try:
+            if not _preflight_ai():
+                print("   [AI] Ждём 5 минут и проверяем Worker снова...")
+                time.sleep(300)
+                continue
+
             session = get_session(network_session=net_session)
             if not session:
                 session, net_session = _reconnect(net_session)

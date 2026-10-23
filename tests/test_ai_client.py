@@ -48,6 +48,22 @@ class _Handler(BaseHTTPRequestHandler):
                 "providers": {"cloudflare": True, "gemini": False, "groq": False, "openrouter": False},
                 "models": ["@cf/openai/gpt-oss-120b"],
             })
+        elif self.path == "/v1/models":
+            behaviour = getattr(self.server, "behaviour", "ok")
+            if behaviour == "no_models":
+                self._send({"error": {"message": "нет такого пути"}}, 404)
+                return
+            self._send({
+                "object": "list",
+                "data": [
+                    {"id": "@cf/openai/gpt-oss-120b"},
+                    {"id": "@cf/qwen/qwen3-30b-a3b-fp8"},
+                    {"id": "@cf/openai/gpt-oss-20b"},
+                    {"id": "gemini-2.5-flash"},
+                    {"id": "gemini-2.5-pro"},
+                    {"id": "gemini-2.0-flash"},
+                ],
+            })
         else:
             self._send({"error": {"message": "нет такого пути"}}, 404)
 
@@ -77,6 +93,15 @@ class _Handler(BaseHTTPRequestHandler):
                 self.server.limit_first_done = True
                 self._send({"error": {"message": "дневной бесплатный лимит нейронов исчерпан", "type": "ai_limit_reached"}}, 429)
                 return
+        if behaviour == "unknown_model":
+            self._send({
+                "error": {
+                    "message": 'модель "gemini-3.6-flash" не поддерживается. '
+                               "Доступные: @cf/openai/gpt-oss-120b, gemini-2.5-flash, gemini-2.5-pro",
+                    "type": "unknown_model",
+                }
+            }, 400)
+            return
         if behaviour == "error500":
 
             self._send({"error": {"message": "ошибка модели", "type": "ai_error"}}, 502)
@@ -346,3 +371,81 @@ class TestGeminiOnly:
         with pytest.raises(ai_client.AIUnavailable) as error:
             ai_client.ai_ask([{"role": "user", "content": "привет"}])
         assert "AI_WORKER_URL" in str(error.value)
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# 6. Worker должен знать модель из AI_MODEL_PRIORITY
+# ═══════════════════════════════════════════════════════════════════════
+
+class TestModelSupport:
+
+    def test_supported_models_from_worker(self, client):
+        models = client.supported_models()
+        assert "gemini-2.5-flash" in models
+        assert "@cf/qwen/qwen3-30b-a3b-fp8" in models
+
+    def test_supported_models_falls_back_to_health(self, client, worker_url):
+        """Старый Worker без /v1/models: список берём из /health."""
+        url, server = worker_url
+        server.behaviour = "no_models"
+        models = client.supported_models()
+        assert models == ["@cf/openai/gpt-oss-120b"]
+
+    def test_supported_models_empty_without_url(self):
+        assert ai_client.AIClient(base_url="").supported_models() == []
+
+    def test_check_model_support_detects_outdated_worker(self, monkeypatch, worker_url):
+        """Именно эта ситуация и сломала запуск: Worker v1.0 не знает gemini-3.6-flash."""
+        url, server = worker_url
+        server.behaviour = "ok"
+        monkeypatch.setattr(
+            ai_client, "client", ai_client.AIClient(base_url=url, token="test-token", timeout=10)
+        )
+
+        missing, available = ai_client.check_model_support(["gemini-3.6-flash"])
+
+        assert missing == ["gemini-3.6-flash"]
+        assert "gemini-2.5-flash" in available
+
+    def test_check_model_support_accepts_known_model(self, monkeypatch, worker_url):
+        url, server = worker_url
+        server.behaviour = "ok"
+        monkeypatch.setattr(
+            ai_client, "client", ai_client.AIClient(base_url=url, token="test-token", timeout=10)
+        )
+
+        missing, available = ai_client.check_model_support(["gemini-2.5-flash"])
+
+        assert missing == []
+        assert available
+
+    def test_check_model_support_silent_when_worker_hides_list(self, monkeypatch, worker_url):
+        """Worker не сообщает список — не пугаем пользователя зря."""
+        url, server = worker_url
+        server.behaviour = "no_models"
+        monkeypatch.setattr(
+            ai_client,
+            "client",
+            ai_client.AIClient(base_url=url, token="test-token", timeout=10),
+        )
+
+        class _NoHealthModels:
+            def supported_models(self):
+                return []
+
+        monkeypatch.setattr(ai_client, "client", _NoHealthModels())
+        missing, available = ai_client.check_model_support(["gemini-3.6-flash"])
+        assert missing == []
+        assert available == []
+
+    def test_unknown_model_raises_model_not_supported(self, client, worker_url):
+        url, server = worker_url
+        server.behaviour = "unknown_model"
+        with pytest.raises(ai_client.AIModelNotSupported) as error:
+            client.chat([{"role": "user", "content": "привет"}], model="gemini-3.6-flash", attempts=1)
+
+        assert "не поддерживается" in str(error.value)
+        assert "gemini-2.5-flash" in error.value.available
+
+    def test_unknown_model_is_subclass_of_error(self):
+        assert issubclass(ai_client.AIModelNotSupported, ai_client.AIError)
