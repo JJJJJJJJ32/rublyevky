@@ -3,6 +3,8 @@
 
 import sys
 import os
+import time
+from concurrent.futures import ThreadPoolExecutor
 
 # Мокаем g4f до импорта модулей бота
 class _MockG4f:
@@ -445,3 +447,46 @@ class TestPreflightAi:
         """Старый Worker без списка моделей не должен блокировать запуск."""
         monkeypatch.setattr(bot_main.ai_client, "check_model_support", lambda models=None: ([], []))
         assert bot_main._preflight_ai() is True
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# 10. Ожидание гайда не должно выглядеть как зависание
+# ═══════════════════════════════════════════════════════════════════════
+
+class TestGuideHeartbeat:
+
+    def test_fast_guide_is_silent(self, capsys):
+        """Быстрый гайд не добавляет в консоль лишних строк."""
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            future = pool.submit(lambda: ("гайд", 0.1))
+            result = bot_main._await_content(future)
+
+        assert result == ("гайд", 0.1)
+        assert "ещё считается" not in capsys.readouterr().out
+
+    def test_slow_guide_prints_heartbeat(self, monkeypatch, capsys):
+        monkeypatch.setattr(bot_main, "GUIDE_HEARTBEAT_SECONDS", 0.05)
+
+        def _slow():
+            time.sleep(0.4)
+            return "длинный гайд", 0.4
+
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            future = pool.submit(_slow)
+            result = bot_main._await_content(future)
+
+        assert result == ("длинный гайд", 0.4)
+        output = capsys.readouterr().out
+        assert "Гайд ещё считается" in output
+        # heartbeat не выдаёт ни модели, ни текста гайда
+        assert "gemini" not in output and "длинный гайд" not in output
+
+    def test_heartbeat_repeats(self, monkeypatch, capsys):
+        """Если гайд считается минуты, строка «всё ещё считаем» повторяется."""
+        monkeypatch.setattr(bot_main, "GUIDE_HEARTBEAT_SECONDS", 0.05)
+
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            future = pool.submit(lambda: time.sleep(2.2) or ("гайд", 2.2))
+            bot_main._await_content(future)
+
+        assert capsys.readouterr().out.count("Гайд ещё считается") >= 2
