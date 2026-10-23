@@ -136,6 +136,28 @@ def _print_lot_status(index, total, ok, reason=None):
         print(f"[{index}/{total}] ❌ НЕ ВЫСТАВЛЕНО: {reason or 'ошибка публикации'}")
 
 
+# Сколько ждать, прежде чем написать «гайд ещё считается». Молчать минутами
+# нельзя: со стороны это выглядит как зависание.
+GUIDE_HEARTBEAT_SECONDS = 45.0
+
+
+def _await_content(future):
+    """Ждёт результат гайда и раз в GUIDE_HEARTBEAT_SECONDS печатает «всё ещё считаем».
+
+    Одна короткая строка без модели, таймингов и текста гайда — только чтобы
+    было видно, что бот жив. Если гайд готов быстро, строка не печатается вовсе.
+    """
+    started = time.perf_counter()
+    last_said = started
+    while not future.done():
+        time.sleep(1.0)
+        now = time.perf_counter()
+        if now - last_said >= GUIDE_HEARTBEAT_SECONDS:
+            print(f"   ⏳ Гайд ещё считается ({int(now - started)} с)...")
+            last_said = now
+    return future.result()
+
+
 def process_single_game(session, game_data, net_session):
     game_name = game_data["game_name"]
     metrics = {
@@ -173,6 +195,9 @@ def process_single_game(session, game_data, net_session):
         section_name = get_category_info(session, game_id)
         print(f"\n🌍 РАЗДЕЛ: {section_name} ({found['type']})")
         print(f"📊 ИГРА: {game_name.upper()}")
+        # Дальше идут сетевые вызовы и запросы к ИИ: без этой строки консоль
+        # минутами молчала бы, и это выглядело бы как зависание.
+        print("⏳ Считаем гайды и публикуем лоты...")
 
         # 15 товаров: 3 подходящих обязательных + до 12 от ИИ.
         final_ideas = build_final_ideas(game_name, ai_ideas, section_name)
@@ -193,12 +218,12 @@ def process_single_game(session, game_data, net_session):
         for i, idea in enumerate(final_ideas):
             logger.debug(f"Товар {i + 1}/{len(final_ideas)}: {idea['title']}")
 
-            if content_future is not None:
-                content, guide_seconds = content_future.result()
-                content_future = None
-                logger.debug("Берём заранее подготовленный гайд")
-            else:
-                content, guide_seconds = _generate_content_timed(idea, game_name)
+            if content_future is None:
+                content_future = content_pool.submit(
+                    _generate_content_timed, idea, game_name
+                )
+            content, guide_seconds = _await_content(content_future)
+            content_future = None
             metrics["guides"] += guide_seconds
             metrics["guide_count"] += 1
 
