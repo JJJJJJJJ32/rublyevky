@@ -490,3 +490,62 @@ class TestGuideHeartbeat:
             bot_main._await_content(future)
 
         assert capsys.readouterr().out.count("Гайд ещё считается") >= 2
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# 11. Сбой поиска раздела и сбой ИИ не должны стирать список игр
+# ═══════════════════════════════════════════════════════════════════════
+
+def _run_game_with_error(monkeypatch, capsys, error):
+    """Прогоняет игру, где поиск раздела падает с заданной ошибкой."""
+    removed = []
+    marked = []
+
+    monkeypatch.setattr(bot_main, "_generate_ideas_timed", lambda name: ([], 0.01))
+    monkeypatch.setattr(
+        bot_main,
+        "find_funpay_category",
+        lambda session, name: (_ for _ in ()).throw(error),
+    )
+    monkeypatch.setattr(bot_main, "remove_game_from_list", lambda name: removed.append(name))
+    monkeypatch.setattr(bot_main, "mark_as_processed", lambda game_id: marked.append(game_id))
+
+    bot_main.process_single_game(
+        session=object(),
+        game_data=_FakeGameData({"game_name": "Some Game"}),
+        net_session=object(),
+    )
+    return removed, marked, capsys.readouterr().out
+
+
+class TestLookupFailureKeepsGamesList:
+
+    def test_network_error_keeps_game(self, monkeypatch, capsys):
+        removed, marked, output = _run_game_with_error(
+            monkeypatch, capsys, bot_main.CategoryLookupError("сетевая ошибка")
+        )
+
+        assert removed == [], "сетевой сбой не должен удалять игру из списка"
+        assert marked == []
+        assert "Не удалось проверить игру на FunPay" in output
+        assert "остаётся в списке" in output
+
+    def test_ai_error_keeps_game(self, monkeypatch, capsys):
+        removed, marked, output = _run_game_with_error(
+            monkeypatch, capsys, bot_main.ai_client.AIUnavailable("Worker недоступен")
+        )
+
+        assert removed == [], "сбой ИИ не должен удалять игру из списка"
+        assert marked == []
+        assert "ИИ не ответил" in output
+        assert "остаётся в списке" in output
+
+    def test_unexpected_error_keeps_game(self, monkeypatch, capsys):
+        removed, marked, output = _run_game_with_error(
+            monkeypatch, capsys, RuntimeError("неожиданный сбой")
+        )
+
+        assert removed == [], "неожиданный сбой не должен удалять игру из списка"
+        assert marked == []
+        assert "Ошибка в игре" in output
+        assert "остаётся в списке" in output

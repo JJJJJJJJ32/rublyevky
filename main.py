@@ -23,9 +23,20 @@ from modules.funpay_auth import get_session
 from modules.network import setup_network, recheck_network, get_proxy_url
 from modules.lot_publisher import publish_lot, get_category_info, RESULT_SUCCESS
 from modules.duplicate_checker import is_game_processed, mark_as_processed
-from modules.category_finder import find_funpay_category
+from modules.category_finder import find_funpay_category, CategoryLookupError
 from modules.mandatory_products import select_mandatory_products
 from modules import ai_client
+
+
+# Windows: при перенаправлении вывода (файл, планировщик, IDE) консоль может
+# быть в cp1251, и print() с эмодзи падает с UnicodeEncodeError. Замена
+# непечатных символов не даёт этой ошибке попасть в обработку игры.
+for _stream in (sys.stdout, sys.stderr):
+    if hasattr(_stream, "reconfigure"):
+        try:
+            _stream.reconfigure(errors="replace")
+        except Exception:
+            pass
 
 
 def _reconnect(net_session):
@@ -177,7 +188,17 @@ def process_single_game(session, game_data, net_session):
         # Это экономит время, но не создаёт очередь из десятков запросов.
         with ThreadPoolExecutor(max_workers=1) as preparation_pool:
             ideas_future = preparation_pool.submit(_generate_ideas_timed, game_name)
-            found = find_funpay_category(session, game_name)
+            try:
+                found = find_funpay_category(session, game_name)
+            except CategoryLookupError as error:
+                # FunPay не ответил — это не «игры нет». Игру не трогаем,
+                # иначе сетевой сбой стирает data/games_list.txt.
+                print(f"   [!] Не удалось проверить игру на FunPay: {error}")
+                print("       Игра остаётся в списке — повторим позже.")
+                logger.log_error(
+                    f"Поиск раздела {game_name}: {error} — игра остаётся в списке"
+                )
+                return session, net_session
 
             if not found:
                 print(f"   [!] Игра '{game_name}' не найдена. Пропуск.")
@@ -358,10 +379,16 @@ def process_single_game(session, game_data, net_session):
     except ai_client.AILimitReached:
         # Главный цикл решает, как переждать общий лимит, не удаляя игру.
         raise
+    except ai_client.AIError as error:
+        # Любой сбой ИИ (лимит, недоступный Worker, неизвестная модель) —
+        # не повод удалять игру: повторим её в следующем круге.
+        print(f"   [!] ИИ не ответил: {error}")
+        print("       Игра остаётся в списке — повторим позже.")
+        logger.log_error(f"ИИ не ответил на игре {game_name}: {error} — игра остаётся в списке")
     except Exception as error:
         print(f"   [!] Ошибка в игре: {error}")
-        logger.log_error(f"Ошибка обработки игры {game_name}: {error}")
-        remove_game_from_list(game_name)
+        print("       Игра остаётся в списке — повторим позже.")
+        logger.log_error(f"Ошибка обработки игры {game_name}: {error} — игра остаётся в списке")
     finally:
         if content_future is not None:
             content_future.cancel()
