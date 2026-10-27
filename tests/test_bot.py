@@ -6,6 +6,8 @@ import os
 import time
 from concurrent.futures import ThreadPoolExecutor
 
+import pytest
+
 # Мокаем g4f до импорта модулей бота
 class _MockG4f:
     class ChatCompletion:
@@ -531,11 +533,38 @@ class TestLookupFailureKeepsGamesList:
         assert "остаётся в списке" in output
 
     def test_ai_error_keeps_game(self, monkeypatch, capsys):
-        removed, marked, output = _run_game_with_error(
-            monkeypatch, capsys, bot_main.ai_client.AIUnavailable("Worker недоступен")
+        """Недоступный Worker отпускает игру в главный цикл, но не удаляет её."""
+        removed = []
+        monkeypatch.setattr(bot_main, "_generate_ideas_timed", lambda name: ([], 0.01))
+        monkeypatch.setattr(
+            bot_main,
+            "find_funpay_category",
+            lambda session, name: (_ for _ in ()).throw(
+                bot_main.ai_client.AIUnavailable("Worker недоступен")
+            ),
         )
+        monkeypatch.setattr(bot_main, "remove_game_from_list", lambda name: removed.append(name))
+        monkeypatch.setattr(bot_main, "mark_as_processed", lambda game_id: removed.append(game_id))
+
+        with pytest.raises(bot_main.ai_client.AIUnavailable):
+            bot_main.process_single_game(
+                session=object(),
+                game_data=_FakeGameData({"game_name": "Some Game"}),
+                net_session=object(),
+            )
 
         assert removed == [], "сбой ИИ не должен удалять игру из списка"
+        output = capsys.readouterr().out
+        assert "ИИ недоступен" in output
+        assert "остаётся в списке" in output
+
+    def test_plain_ai_error_keeps_game(self, monkeypatch, capsys):
+        """Обычная ошибка ИИ не роняет обработку и не удаляет игру."""
+        removed, marked, output = _run_game_with_error(
+            monkeypatch, capsys, bot_main.ai_client.AIError("пустой ответ")
+        )
+
+        assert removed == [], "ошибка ИИ не должна удалять игру из списка"
         assert marked == []
         assert "ИИ не ответил" in output
         assert "остаётся в списке" in output

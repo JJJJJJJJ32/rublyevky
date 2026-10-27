@@ -296,6 +296,15 @@ def _ask(messages, max_tokens=None, temperature=None):
         return ai_client.ai_ask(messages, max_tokens=max_tokens, temperature=temperature)
     except ai_client.AILimitReached:
         raise  # дневной лимит — наверху решают, ждать или остановиться
+    except ai_client.AIUnavailable as e:
+        # Worker, сеть или провайдер недоступны. Менять промпт и просить
+        # другой вариант текста бессмысленно — сразу наверх, игру не трогаем.
+        logger.log_error(f"ИИ недоступен: {e}")
+        raise
+    except ai_client.AIModelNotSupported as e:
+        # Worker не знает модель — повторять другими промптами тоже незачем.
+        logger.log_error(f"Модель не поддерживается: {e}")
+        raise
     except ai_client.AIError as e:
         logger.log_error(f"ИИ недоступен: {e}")
         return None
@@ -340,14 +349,16 @@ def ai_generate_product_ideas(game_name):
         if not response:
             continue
         match = re.search(r"\[\s*\{.*\}\s*\]", response, re.DOTALL)
-        if match:
-            try:
-                data = json.loads(match.group(0))
-                if len(data) >= 5:
-                    return data
-                logger.info(f"Идей мало ({len(data)}), пробуем ещё раз")
-            except ValueError:
-                logger.info("Ответ не разобрался как JSON, пробуем ещё раз")
+        if not match:
+            logger.info("В ответе ИИ нет JSON-массива идей, пробуем ещё раз")
+            continue
+        try:
+            data = json.loads(match.group(0))
+            if len(data) >= 5:
+                return data
+            logger.info(f"Идей мало ({len(data)}), пробуем ещё раз")
+        except ValueError:
+            logger.info("Ответ не разобрался как JSON, пробуем ещё раз")
     logger.info("Идеи получить не удалось — будут только обязательные товары")
     return []
 
@@ -361,7 +372,7 @@ def ai_generate_full_content(idea, game_name):
     title = idea["title"]
 
     prompt_main = f"""Напиши подробный гайд на РУССКОМ ЯЗЫКЕ по теме «{title}» для игры «{game_name}».
-Нужно примерно 700–900 слов, но не растягивай текст пустыми фразами. Начни сразу с
+Нужно примерно 450–550 слов, но не растягивай текст пустыми фразами. Начни сразу с
 конкретного действия или настройки: что открыть, куда пойти, что включить или выключить.
 Для темы про оптимизацию ПК начни с конкретных настроек игры, Windows, драйвера или
 видеокарты, а не с истории. В первом же предложении назови игру «{game_name}».
@@ -392,7 +403,7 @@ def ai_generate_full_content(idea, game_name):
 """
 
     prompt_continue = (
-        "Продолжи гайд ещё минимум на 400 слов. Дай новые конкретные игровые детали, "
+        "Продолжи гайд ещё на 300–400 слов. Дай новые конкретные игровые детали, "
         "цифры, условия и порядок действий, не повторяй уже написанное. Пиши обычными "
         "абзацами разной длины, без Markdown-заголовков, длинных рядов буллитов и "
         "фраз «В заключение», «Итоги», «Вывод», «Таким образом», «Важно отметить» или "
@@ -400,7 +411,7 @@ def ai_generate_full_content(idea, game_name):
 
     prompt_alt = f"""Опиши рабочий способ по теме «{title}» в игре «{game_name}» так, как объяснил бы
 его опытный игрок товарищу. Напиши живой подробный текст на русском языке объёмом
-не меньше 600 слов. Начни с конкретной игровой ситуации: куда идти, что выбрать или
+примерно 450–550 слов. Начни с конкретной игровой ситуации: куда идти, что выбрать или
 какую ошибку исправить. Добавь проверяемые детали — названия, числа, время, расстояния,
 условия и порядок действий. Не начинай с фраз «Представь, что ты» и не сочиняй сказочных
 сцен: только то, что реально относится к «{game_name}» и теме «{title}».
@@ -432,7 +443,7 @@ def ai_generate_full_content(idea, game_name):
 - финальные разделы «Итоги», «Вывод», «Заключение» и Markdown-заголовки ##;
 - превращать весь текст в список: обычных абзацев должно быть больше.
 
-Объём — не меньше 600 слов. Плохой общий текст без связи с игрой будет отбракован."""
+Объём — примерно 450–550 слов. Плохой общий текст без связи с игрой будет отбракован."""
 
     def _accept(response, stage):
         """Общая проверка ответа: очистка, отказ, длина, списки и связь с игрой."""
@@ -459,38 +470,47 @@ def ai_generate_full_content(idea, game_name):
         """Принимает длинный текст, но не принимает список после очистки."""
         return bool(result) and not _is_list_heavy(result)
 
-    # === ПОПЫТКА 1: основной промпт ===
-    result = _accept(_ask([{"role": "user", "content": prompt_main}], max_tokens=3000), "основной промпт")
+    # === ПОПЫТКА 1: основной промпт, при нехватке слов — дописывание ===
+    # Один запрос на 700–900 слов идёт дольше 40 секунд, и соединение с
+    # Worker'ом успевает оборваться. Две части по ~500 и ~350 слов
+    # приходят заметно быстрее и собираются в цельный гайд.
+    result = _accept(
+        _ask([{"role": "user", "content": prompt_main}], max_tokens=2200),
+        "основной промпт",
+    )
     if result:
-        if _is_guide_good(result):
-            return result
-        if len(result) > 200:
+        if _count_words(result) < 650:
             logger.info(f"Гайд короткий ({_count_words(result)} слов). Просим дописать")
-            more = _accept(
-                _ask([
-                    {"role": "user", "content": prompt_main},
-                    {"role": "assistant", "content": result},
-                    {"role": "user", "content": prompt_continue},
-                ], max_tokens=2000),
-                "дописывание",
-            )
+            try:
+                more = _accept(
+                    _ask([
+                        {"role": "user", "content": prompt_main},
+                        {"role": "assistant", "content": result},
+                        {"role": "user", "content": prompt_continue},
+                    ], max_tokens=1600),
+                    "дописывание",
+                )
+            except ai_client.AIUnavailable:
+                # Первая часть уже есть — не выбрасываем её из-за обрыва связи.
+                logger.log_error("Дописывание не удалось: Worker недоступен, оставляем первую часть")
+                more = None
             if more:
                 result = _postprocess_guide(result + "\n\n" + more)
-                if _is_guide_good(result):
-                    return result
+        if _is_guide_good(result) and _usable(result):
+            return result
         if len(result) > 500 and _usable(result):
             logger.info(f"Гайд получен ({_count_words(result)} слов)")
             return result
 
     # === ПОПЫТКА 2: другой промпт ===
-    result = _accept(_ask([{"role": "user", "content": prompt_alt}], max_tokens=3000), "альтернативный промпт")
+    result = _accept(_ask([{"role": "user", "content": prompt_alt}], max_tokens=2200), "альтернативный промпт")
     if result and len(result) > 500 and _usable(result):
         logger.info(f"Гайд получен через альт. промпт ({_count_words(result)} слов)")
         return result
 
     # === ПОПЫТКА 3: повтор основного промпта (модель может ответить иначе) ===
     time.sleep(2)
-    result = _accept(_ask([{"role": "user", "content": prompt_main}], max_tokens=3000), "повтор")
+    result = _accept(_ask([{"role": "user", "content": prompt_main}], max_tokens=2200), "повтор")
     if result:
         if _is_guide_good(result):
             return result
@@ -500,7 +520,7 @@ def ai_generate_full_content(idea, game_name):
 
     # === ПОПЫТКА 4: самый строгий промпт — только конкретика по игре ===
     time.sleep(2)
-    result = _accept(_ask([{"role": "user", "content": prompt_strict}], max_tokens=3000), "строгий промпт")
+    result = _accept(_ask([{"role": "user", "content": prompt_strict}], max_tokens=2200), "строгий промпт")
     if result:
         if _is_guide_good(result):
             return result

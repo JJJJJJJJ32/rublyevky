@@ -9,6 +9,9 @@ from modules.ai_generator import (
     _postprocess_guide,
     ai_generate_full_content,
 )
+import pytest
+
+from modules import ai_client
 
 
 FORBIDDEN_PHRASES = (
@@ -272,3 +275,85 @@ def test_all_bad_guides_are_not_published(monkeypatch):
     monkeypatch.setattr("modules.ai_generator.time.sleep", lambda seconds: None)
 
     assert ai_generate_full_content(IDEA, GAME) is None
+
+
+def test_short_guide_is_extended_in_second_request(monkeypatch):
+    """Гайд просят двумя короткими запросами: длинный ответ обрывается по сети."""
+    part2 = (
+        "Дальше по Cyberpunk 2077 проверь ещё один параметр в настройках графики: "
+        "отключи трассировку лучей на слабой видеокарте и сравни FPS на том же "
+        "маршруте. Если просадки остались, снизь качество теней и обнови драйвер."
+    )
+    calls = []
+
+    def fake_ask(messages, **kwargs):
+        calls.append(messages[0]["content"])
+        return _good_guide() if len(calls) == 1 else part2
+
+    monkeypatch.setattr("modules.ai_generator._ask", fake_ask)
+    monkeypatch.setattr("modules.ai_generator.time.sleep", lambda seconds: None)
+
+    result = ai_generate_full_content(IDEA, GAME)
+
+    assert len(calls) == 2, "короткий гайд должен дописываться вторым запросом"
+    assert result is not None
+    assert "Дальше по Cyberpunk 2077" in result
+    assert "Открой настройки Cyberpunk 2077" in result
+
+
+def test_continuation_failure_keeps_first_part(monkeypatch):
+    """Если дописывание оборвалось, уже полученная часть не выбрасывается."""
+    calls = []
+
+    def fake_ask(messages, **kwargs):
+        calls.append(messages[0]["content"])
+        if len(calls) == 1:
+            return _good_guide()
+        raise ai_client.AIUnavailable("обрыв связи")
+
+    monkeypatch.setattr("modules.ai_generator._ask", fake_ask)
+
+    result = ai_generate_full_content(IDEA, GAME)
+
+    assert len(calls) == 2
+    assert result is not None
+    assert "Открой настройки Cyberpunk 2077" in result
+
+
+def test_unavailable_worker_stops_guide_attempts(monkeypatch):
+    """Если Worker недоступен, не тратим четыре попытки на разные промпты."""
+    calls = []
+
+    def fake_ask(messages, **kwargs):
+        calls.append(messages[0]["content"])
+        raise ai_client.AIUnavailable("Worker не отвечает")
+
+    monkeypatch.setattr("modules.ai_generator._ask", fake_ask)
+
+    with pytest.raises(ai_client.AIUnavailable):
+        ai_generate_full_content(IDEA, GAME)
+
+    assert len(calls) == 1
+
+
+def test_ask_propagates_unavailable(monkeypatch):
+    import modules.ai_generator as ai_generator
+
+    def boom(*args, **kwargs):
+        raise ai_client.AIUnavailable("нет Worker")
+
+    monkeypatch.setattr(ai_generator.ai_client, "ai_ask", boom)
+
+    with pytest.raises(ai_client.AIUnavailable):
+        ai_generator._ask([{"role": "user", "content": "тест"}])
+
+
+def test_ask_swallows_ordinary_ai_error(monkeypatch):
+    import modules.ai_generator as ai_generator
+
+    def boom(*args, **kwargs):
+        raise ai_client.AIError("пустой ответ")
+
+    monkeypatch.setattr(ai_generator.ai_client, "ai_ask", boom)
+
+    assert ai_generator._ask([{"role": "user", "content": "тест"}]) is None

@@ -246,9 +246,11 @@ class AIClient:
                     # перебирать модели бессмысленно — сразу понятная ошибка.
                     logger.info(f"[AI] Worker недоступен: {_short_network_error(e)}")
                     raise AIUnavailable(_short_network_error(e))
-                except requests.exceptions.Timeout:
-                    last_error = AIError(f"{model_name}: таймаут {self.timeout} с")
-                    logger.info(f"[AI] {last_error}")
+                except requests.exceptions.Timeout as e:
+                    # Таймаут — та же недоступность Worker'а. Ждать ещё 180
+                    # секунд на повтор бессмысленно: сразу наверх, игру не трогаем.
+                    logger.info(f"[AI] Worker не ответил вовремя: {_short_network_error(e)}")
+                    raise AIUnavailable(_short_network_error(e))
                 except requests.exceptions.RequestException as e:
                     last_error = AIUnavailable(_short_network_error(e))
                     logger.info(f"[AI] {last_error}")

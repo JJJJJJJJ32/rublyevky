@@ -15,6 +15,7 @@ import threading
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 import pytest
+import requests
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 
@@ -449,3 +450,33 @@ class TestModelSupport:
 
     def test_unknown_model_is_subclass_of_error(self):
         assert issubclass(ai_client.AIModelNotSupported, ai_client.AIError)
+
+
+class TestTimeoutIsFatal:
+    """Таймаут — это недоступность Worker'а, а не повод ждать ещё 180 секунд."""
+
+    def test_timeout_raises_unavailable_without_retry(self):
+        class _TimeoutSession:
+            def __init__(self):
+                self.calls = 0
+
+            def post(self, *args, **kwargs):
+                self.calls += 1
+                raise requests.exceptions.ReadTimeout("timed out")
+
+        session = _TimeoutSession()
+        client = ai_client.AIClient(
+            base_url="http://worker.test",
+            token="test-token",
+            session=session,
+            timeout=1,
+            models=["gemini-3.6-flash"],
+        )
+
+        with pytest.raises(ai_client.AIUnavailable):
+            client.chat(
+                [{"role": "user", "content": "тест"}],
+                model="gemini-3.6-flash",
+            )
+
+        assert session.calls == 1, "после таймаута не нужно повторять тот же запрос"

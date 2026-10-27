@@ -379,6 +379,13 @@ def process_single_game(session, game_data, net_session):
     except ai_client.AILimitReached:
         # Главный цикл решает, как переждать общий лимит, не удаляя игру.
         raise
+    except ai_client.AIUnavailable as error:
+        # Worker/провайдер недоступен. Игру не трогаем, а главный цикл
+        # подождёт подольше, чтобы не долбить ИИ каждые 5 секунд.
+        print(f"   [!] ИИ недоступен: {error}")
+        print("       Игра остаётся в списке — повторим позже.")
+        logger.log_error(f"ИИ недоступен на игре {game_name}: {error} — игра остаётся в списке")
+        raise
     except ai_client.AIError as error:
         # Любой сбой ИИ (лимит, недоступный Worker, неизвестная модель) —
         # не повод удалять игру: повторим её в следующем круге.
@@ -582,6 +589,10 @@ def main():
             print(f"   [AI] ⚠️ Лимит ИИ исчерпан: {e}")
             print("   [AI]    Ждём 30 минут и продолжаем с этого же места.")
             time.sleep(1800)
+        except ai_client.AIUnavailable as e:
+            print(f"   [AI] ⚠️ Worker или провайдер недоступен: {e}")
+            print("   [AI]    Ждём 60 секунд и пробуем снова (игра не потеряна).")
+            time.sleep(60)
         except Exception as e:
             print(f"💥 Ошибка цикла: {e}")
             logger.log_error(f"Ошибка главного цикла: {e}")
