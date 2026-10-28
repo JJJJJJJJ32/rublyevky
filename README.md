@@ -229,6 +229,44 @@ cd C:\путь\к\rublyevky
 py main.py --selftest
 ```
 
+### Свой домен вместо `workers.dev`
+
+В РФ провайдеры периодически блокируют все адреса `*.workers.dev` по имени хоста. Признак: FunPay, Google Drive и `generativelanguage.googleapis.com` открываются, а Worker отдаёт `ConnectionResetError 10054` или таймаут. Код и токен тут ни при чём — обрывается само TLS-соединение.
+
+Проверить, что дело в имени, а не в адресе Cloudflare:
+
+```powershell
+curl.exe -4 -o NUL -w "worker: %{http_code}`n" --max-time 10 https://имя-твоего-worker.workers.dev/health
+curl.exe -4 -o NUL -w "cloudflare на том же IP: %{http_code}`n" --max-time 10 --resolve www.cloudflare.com:443:104.21.79.114 https://www.cloudflare.com/cdn-cgi/trace
+```
+
+Если Cloudflare отвечает `200`, а Worker — `000`, нужен свой домен. Он бесплатно привязывается к тому же Worker'у, код бота и `worker.js` менять не нужно.
+
+1. Купи домен у любого регистратора (подойдёт самый дешёвый, например `.ru`).
+2. В [Cloudflare Dashboard](https://dash.cloudflare.com) нажми **Add a site**, введи домен, выбери план **Free**.
+3. Cloudflare покажет два своих NS-сервера. Пропиши их у регистратора вместо старых и дождись письма «сайт активен» (от нескольких минут до нескольких часов).
+4. Открой **Workers & Pages → твой Worker → Settings → Domains & Routes → Add → Custom domain**.
+5. Введи поддомен, например `ai.твой-домен.ru`, и нажми **Add domain**. Cloudflare сам создаст DNS-запись и выпустит сертификат (обычно за минуту).
+6. В `.env` замени адрес Worker'а:
+
+   ```dotenv
+   AI_WORKER_URL=https://ai.твой-домен.ru
+   ```
+
+   Слэш на конце не нужен. `AI_WORKER_TOKEN` остаётся прежним, Worker передеплоивать не нужно.
+7. Проверь:
+
+   ```powershell
+   curl.exe -4 https://ai.твой-домен.ru/health
+   py main.py --selftest
+   ```
+
+   В `/health` должен быть тот же JSON с `"version": "1.1"` и `"gemini": true`.
+
+Бери поддомен (`ai.`), а не сам домен: на apex-домене Cloudflare иногда конфликтует с существующими записями. Запись должна оставаться в режиме «Proxied» (оранжевая cloud) — Custom Domain включает его сам.
+
+Если домена нет и покупать не хочется, остаётся `AI_PROXY_URL` (см. раздел 9): прокси только для запросов к Worker'у, FunPay продолжает работать напрямую.
+
 ### Секрет Gemini и региональные ограничения
 
 Gemini — единственная рабочая модель. Её секрет добавляется на Worker, а не в `.env` бота:
@@ -603,6 +641,14 @@ curl https://имя-твоего-worker.workers.dev/v1/models
 Как выйти из ситуации быстро, не трогая Worker: вписать в `.env` старую модель, которую Worker ещё помнит — `AI_MODEL_PRIORITY=gemini-2.5-flash`. Это временное решение: такие модели Google выводит из эксплуатации, поэтому основной вариант — обновление Worker'а.
 
 Пока Worker не знает модель, бот не публикует лоты и не удаляет игры из списка: он ждёт 5 минут и проверяет снова. Так сбой ИИ не съедает `data/games_list.txt`.
+
+### `ConnectionResetError 10054` или таймаут до Worker'а
+
+Самопроверка пишет `сетевая ошибка: ('Connection aborted.', ConnectionResetError(10054, ...))` или просто не дожидается ответа. Токен и модель тут не при чём: до Worker'а не доходит соединение.
+
+Причина почти всегда одна — провайдер блокирует `*.workers.dev` по имени хоста. Лечится своим доменом для Worker'а (шаги в разделе [«Свой домен вместо `workers.dev`»](#свой-домен-вместо-workersdev)) или строкой `AI_PROXY_URL` в `.env`. Подробнее — раздел 9.
+
+Пока Worker недоступен, бот не удаляет игры из списка: пишет причину и ждёт 60 секунд.
 
 ### `429 ai_limit_reached`
 
