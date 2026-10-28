@@ -432,6 +432,14 @@ def run_selftest():
     print(f"   • GOOGLE_DRIVE_FOLDER_ID: {'✅ есть' if os.getenv('GOOGLE_DRIVE_FOLDER_ID') else '❌ нет'}")
     print(f"   • AI_WORKER_URL: {'✅ есть' if ai_client.get_worker_url() else '⚠️ нет (настрой Cloudflare Worker)'}")
     print(f"   • AI_WORKER_TOKEN: {'✅ есть' if ai_client.get_worker_token() else '⚠️ нет'}")
+    print(
+        "   • GEMINI_API_KEY: "
+        + (
+            "✅ есть (прямой путь, если Worker заблокирован)"
+            if ai_client.direct_available()
+            else "— нет (только через Worker)"
+        )
+    )
     print(f"   • PROXY_URL: {'✅ задан' if get_proxy_url() else '— не задан (ходим напрямую)'}")
     print(
         "   • AI_PROXY_URL: "
@@ -463,13 +471,16 @@ def run_selftest():
                 print(f"   • подсказка: {info['hint']}")
         else:
             print(f"   ❌ {info}")
-            if ai_client.get_ai_proxy():
+            if ai_client.direct_available():
+                print("      В .env есть GEMINI_API_KEY — бот пойдёт в Gemini API напрямую, без Worker'а.")
+            elif ai_client.get_ai_proxy():
                 print("      Прокси для ИИ задан, но Worker всё равно не ответил — проверь сам прокси.")
             else:
                 print("      Частая причина в РФ — провайдер блокирует *.workers.dev по имени хоста.")
                 print("      Варианты: 1) свой домен для Worker'а: AI_WORKER_URL=https://ai.ваш-домен")
                 print("                2) прокси: AI_PROXY_URL=http://логин:пароль@хост:порт в .env")
-            problems.append(f"Worker: {info}")
+                print("                3) бесплатно: GEMINI_API_KEY=... в .env — прямой путь в Gemini")
+                problems.append(f"Worker: {info}")
 
         # Модель из AI_MODEL_PRIORITY должна быть известна Worker'у.
         missing, available = ai_client.check_model_support()
@@ -569,7 +580,7 @@ def _preflight_ai():
 
 
 def main():
-    print("=== FUNPAY AUTO-BOT v19.10 (без Запрета, ИИ через Cloudflare Worker) ===\n")
+    print("=== FUNPAY AUTO-BOT v19.11 (без Запрета, ИИ через Cloudflare Worker) ===\n")
 
     net_session, net_ok = setup_network()
     if not net_ok:

@@ -520,3 +520,131 @@ class TestAIProxy:
             "http://***@proxy.local:8080"
         )
         assert ai_client._mask_proxy("proxy.local:8080") == "proxy.local:8080"
+
+
+class _FakeResponse:
+    def __init__(self, status_code=200, data=None, text=""):
+        self.status_code = status_code
+        self._data = data if data is not None else {}
+        self.text = text or json.dumps(self._data)
+
+    def json(self):
+        return self._data
+
+
+class _WorkerDownGeminiSession:
+    """Worker рвёт соединение, Gemini API отвечает как настоящий."""
+
+    def __init__(self, response):
+        self.response = response
+        self.calls = []
+
+    def post(self, url, **kwargs):
+        self.calls.append((url, kwargs))
+        if url.endswith("/v1/chat/completions"):
+            raise requests.exceptions.ConnectionError("Connection aborted")
+        if url.endswith(":generateContent"):
+            return self.response
+        raise AssertionError(f"неожиданный адрес: {url}")
+
+
+class TestDirectGeminiFallback:
+    """Провайдер блокирует *.workers.dev — бот спрашивает Gemini напрямую."""
+
+    def _client(self, session):
+        return ai_client.AIClient(
+            base_url="http://worker.test",
+            token="test-token",
+            session=session,
+            timeout=5,
+            models=["gemini-3.6-flash"],
+        )
+
+    def test_worker_blocked_uses_direct_gemini(self, monkeypatch):
+        monkeypatch.setenv("GEMINI_API_KEY", "test-gemini-key")
+        session = _WorkerDownGeminiSession(
+            _FakeResponse(
+                data={
+                    "candidates": [{"content": {"parts": [{"text": "Ответ напрямую"}]}}],
+                    "usageMetadata": {"totalTokenCount": 42, "candidatesTokenCount": 7},
+                }
+            )
+        )
+
+        text = self._client(session).chat([{"role": "user", "content": "привет"}])
+
+        assert text == "Ответ напрямую"
+        urls = [url for url, _ in session.calls]
+        assert urls[0].endswith("/v1/chat/completions")
+        assert urls[1].endswith("/models/gemini-3.6-flash:generateContent")
+        headers = session.calls[1][1]["headers"]
+        assert headers["x-goog-api-key"] == "test-gemini-key"
+
+    def test_worker_blocked_without_key_reports_unavailable(self, monkeypatch):
+        monkeypatch.delenv("GEMINI_API_KEY", raising=False)
+        monkeypatch.setenv("PROXY_URL", "http://proxy.local:3128")
+        session = _WorkerDownGeminiSession(_FakeResponse())
+
+        with pytest.raises(ai_client.AIUnavailable):
+            self._client(session).chat([{"role": "user", "content": "тест"}])
+
+        assert all(url.endswith("/v1/chat/completions") for url, _ in session.calls)
+
+    def test_direct_works_even_without_worker_url(self, monkeypatch):
+        monkeypatch.setenv("GEMINI_API_KEY", "test-gemini-key")
+        session = _WorkerDownGeminiSession(
+            _FakeResponse(
+                data={"candidates": [{"content": {"parts": [{"text": "Без Worker'а"}]}}]}
+            )
+        )
+        client = ai_client.AIClient(
+            base_url="",
+            token="",
+            session=session,
+            timeout=5,
+            models=["gemini-3.6-flash"],
+        )
+
+        assert client.chat([{"role": "user", "content": "тест"}]) == "Без Worker'а"
+        assert len(session.calls) == 1
+
+    def test_direct_limit_is_reported_as_limit(self, monkeypatch):
+        monkeypatch.setenv("GEMINI_API_KEY", "test-gemini-key")
+        session = _WorkerDownGeminiSession(
+            _FakeResponse(
+                status_code=429,
+                data={"error": {"code": 429, "message": "quota exceeded"}},
+            )
+        )
+
+        with pytest.raises(ai_client.AILimitReached):
+            self._client(session).chat([{"role": "user", "content": "тест"}])
+
+    def test_direct_bad_key_is_unavailable(self, monkeypatch):
+        monkeypatch.setenv("GEMINI_API_KEY", "wrong-key")
+        session = _WorkerDownGeminiSession(
+            _FakeResponse(
+                status_code=403,
+                data={"error": {"code": 403, "message": "API key not valid"}},
+            )
+        )
+
+        with pytest.raises(ai_client.AIUnavailable) as error:
+            self._client(session).chat([{"role": "user", "content": "тест"}])
+
+        assert "GEMINI_API_KEY" in str(error.value)
+
+    def test_payload_maps_system_and_assistant_roles(self):
+        payload = ai_client.AIClient._direct_payload(
+            [
+                {"role": "system", "content": "будь краток"},
+                {"role": "user", "content": "вопрос"},
+                {"role": "assistant", "content": "ответ"},
+            ],
+            max_tokens=500,
+            temperature=0.3,
+        )
+
+        assert payload["systemInstruction"]["parts"][0]["text"] == "будь краток"
+        assert [item["role"] for item in payload["contents"]] == ["user", "model"]
+        assert payload["generationConfig"] == {"maxOutputTokens": 500, "temperature": 0.3}

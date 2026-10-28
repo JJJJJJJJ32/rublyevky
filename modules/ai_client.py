@@ -45,6 +45,10 @@ REQUEST_TIMEOUT = int(os.getenv("AI_TIMEOUT", "180"))   # секунды на о
 ATTEMPTS_PER_MODEL = int(os.getenv("AI_ATTEMPTS", "2"))
 USAGE_LOG = os.path.join("logs", "ai_usage.jsonl")
 
+# Прямой Gemini API: резервный путь, когда провайдер блокирует *.workers.dev.
+# Ключ тот же самый, что лежит в секретах Worker'а.
+DIRECT_API_BASE = "https://generativelanguage.googleapis.com/v1beta"
+
 _lock = threading.Lock()
 
 
@@ -84,6 +88,20 @@ def get_ai_proxy():
     и не каждый такой прокси годится для Cloudflare. Пусто — идём напрямую.
     """
     return (os.getenv("AI_PROXY_URL") or os.getenv("PROXY_URL") or "").strip()
+
+
+def get_gemini_key():
+    """Ключ Gemini из .env — резервный путь, если Worker недоступен."""
+    return (os.getenv("GEMINI_API_KEY") or "").strip()
+
+
+def direct_available():
+    """Можно ли спросить Gemini напрямую, минуя Worker."""
+    return bool(get_gemini_key())
+
+
+def _direct_base():
+    return (os.getenv("GEMINI_API_BASE") or DIRECT_API_BASE).strip().rstrip("/")
 
 
 def _mask_proxy(proxy):
@@ -152,6 +170,92 @@ class AIClient:
             headers["Authorization"] = f"Bearer {self.token}"
         return headers
 
+    # ─── Прямой Gemini API (обход блокировки Worker'а) ───────────────────
+
+    @staticmethod
+    def _direct_payload(messages, max_tokens=None, temperature=None):
+        """Переводит сообщения формата OpenAI в тело запроса Gemini."""
+        contents, system_parts = [], []
+        for message in messages or []:
+            role = str(message.get("role") or "user")
+            text = message.get("content")
+            if isinstance(text, list):
+                text = "".join(
+                    part.get("text", "") for part in text if isinstance(part, dict)
+                )
+            text = str(text or "")
+            if role == "system":
+                system_parts.append(text)
+                continue
+            contents.append(
+                {
+                    "role": "model" if role == "assistant" else "user",
+                    "parts": [{"text": text}],
+                }
+            )
+
+        payload = {"contents": contents}
+        if system_parts:
+            payload["systemInstruction"] = {"parts": [{"text": "\n".join(system_parts)}]}
+        config = {}
+        if max_tokens:
+            config["maxOutputTokens"] = int(max_tokens)
+        if temperature is not None:
+            config["temperature"] = float(temperature)
+        if config:
+            payload["generationConfig"] = config
+        return payload
+
+    def direct_chat(self, model_name, messages, max_tokens=None, temperature=None):
+        """
+        Запрос напрямую в Gemini API (generativelanguage.googleapis.com).
+
+        Нужен, когда провайдер режет *.workers.dev: FunPay и Google при этом
+        открываются, поэтому бот продолжает работать без домена и прокси.
+        """
+        key = get_gemini_key()
+        if not key:
+            raise AIUnavailable("GEMINI_API_KEY не задан — прямой путь в Gemini недоступен")
+
+        url = f"{_direct_base()}/models/{model_name}:generateContent"
+        started = time.time()
+        try:
+            resp = self.session.post(
+                url,
+                headers={"Content-Type": "application/json", "x-goog-api-key": key},
+                json=self._direct_payload(messages, max_tokens, temperature),
+                timeout=self.timeout,
+            )
+        except requests.exceptions.RequestException as e:
+            raise AIUnavailable(f"Gemini напрямую недоступен: {_short_network_error(e)}")
+
+        elapsed = round(time.time() - started, 1)
+        error_text = _extract_error(resp)
+
+        if resp.status_code == 429:
+            raise AILimitReached(error_text or f"{model_name}: лимит Gemini исчерпан")
+        if resp.status_code in (401, 403):
+            raise AIUnavailable(f"Gemini отклонил GEMINI_API_KEY: {error_text}")
+        if resp.status_code == 400 and "api key" in error_text.lower():
+            raise AIUnavailable(f"Gemini отклонил GEMINI_API_KEY: {error_text}")
+        if resp.status_code == 404:
+            raise AIModelNotSupported(f"{model_name}: {error_text}")
+        if resp.status_code >= 500:
+            raise AIUnavailable(f"Gemini вернул {resp.status_code}: {error_text}")
+        if resp.status_code != 200:
+            raise AIError(f"{model_name}: Gemini вернул {resp.status_code}: {error_text}")
+
+        data = resp.json()
+        text = _extract_gemini_text(data)
+        if not text:
+            raise AIError(f"{model_name}: Gemini вернул пустой ответ")
+
+        _log_usage(model_name, _gemini_usage(data), elapsed, len(text))
+        logger.info(
+            f"[AI] {model_name} ответила напрямую через Gemini API за {elapsed} с ({len(text)} симв.)"
+        )
+        return text
+
     # ─── Проверка связи ────────────────────────────────────────────────
 
     def health(self):
@@ -212,8 +316,11 @@ class AIClient:
         Один запрос к указанной модели (или к первой доступной из списка).
         Возвращает текст ответа. Бросает AIError-наследников при проблемах.
         """
-        if not self.configured:
-            raise AIUnavailable("AI_WORKER_URL не задан — Worker не настроен")
+        if not self.configured and not direct_available():
+            raise AIUnavailable(
+                "AI_WORKER_URL не задан — Worker не настроен, "
+                "и GEMINI_API_KEY для прямого пути тоже нет"
+            )
 
         models = [model] if model else list(self.models)
         attempts = attempts or ATTEMPTS_PER_MODEL
@@ -221,6 +328,10 @@ class AIClient:
 
         for model_name in models:
             for attempt in range(1, attempts + 1):
+                if not self.configured:
+                    # Worker'а нет вовсе — сразу идём в Gemini API.
+                    return self.direct_chat(model_name, messages, max_tokens, temperature)
+
                 payload = {
                     "model": model_name,
                     "messages": messages,
@@ -267,16 +378,23 @@ class AIClient:
 
                 except AILimitReached:
                     raise
-                except requests.exceptions.ConnectionError as e:
+                except (requests.exceptions.ConnectionError, requests.exceptions.Timeout) as e:
                     # Адрес один для всех моделей: если он недоступен,
-                    # перебирать модели бессмысленно — сразу понятная ошибка.
-                    logger.info(f"[AI] Worker недоступен: {_short_network_error(e)}")
-                    raise AIUnavailable(_short_network_error(e))
-                except requests.exceptions.Timeout as e:
-                    # Таймаут — та же недоступность Worker'а. Ждать ещё 180
-                    # секунд на повтор бессмысленно: сразу наверх, игру не трогаем.
-                    logger.info(f"[AI] Worker не ответил вовремя: {_short_network_error(e)}")
-                    raise AIUnavailable(_short_network_error(e))
+                    # перебирать модели бессмысленно. Если есть ключ Gemini —
+                    # обходим заблокированный Worker и спрашиваем Google напрямую.
+                    reason = _short_network_error(e)
+                    logger.info(f"[AI] Worker недоступен: {reason}")
+                    if not direct_available():
+                        raise AIUnavailable(reason)
+                    logger.info("[AI] Иду в Gemini API напрямую (GEMINI_API_KEY из .env)")
+                    try:
+                        return self.direct_chat(model_name, messages, max_tokens, temperature)
+                    except AILimitReached:
+                        raise
+                    except AIError as direct_error:
+                        raise AIUnavailable(
+                            f"{reason}; напрямую Gemini тоже не ответил: {direct_error}"
+                        ) from direct_error
                 except requests.exceptions.RequestException as e:
                     last_error = AIUnavailable(_short_network_error(e))
                     logger.info(f"[AI] {last_error}")
@@ -375,6 +493,27 @@ def _extract_text(data):
     return ""
 
 
+def _extract_gemini_text(data):
+    """Достаёт текст из нативного ответа Gemini API."""
+    try:
+        candidates = data.get("candidates") or []
+        if not candidates:
+            return ""
+        parts = (candidates[0].get("content") or {}).get("parts") or []
+        return "".join(part.get("text", "") for part in parts if isinstance(part, dict))
+    except Exception:
+        return ""
+
+
+def _gemini_usage(data):
+    """Приводит usageMetadata Gemini к тем же ключам, что у Worker'а."""
+    meta = data.get("usageMetadata") or {}
+    return {
+        "total_tokens": meta.get("totalTokenCount"),
+        "output_tokens": meta.get("candidatesTokenCount"),
+    }
+
+
 def _extract_error(resp):
     """Достаёт человекочитаемую ошибку из ответа Worker'а."""
     try:
@@ -463,11 +602,11 @@ def ai_ask(messages, models=None, max_tokens=None, temperature=None):
     ни Gemini SDK, ни g4f в боте не используются.
     Возвращает текст ответа.
     """
-    if not client.configured:
+    if not client.configured and not direct_available():
         raise AIUnavailable(
-            "ИИ не настроен: в .env нет AI_WORKER_URL. "
+            "ИИ не настроен: в .env нет AI_WORKER_URL и нет GEMINI_API_KEY. "
             "Поднимите Cloudflare Worker (см. README.md, раздел 4) "
-            "и впишите его адрес в .env."
+            "и впишите его адрес в .env — или добавьте ключ Gemini для прямого пути."
         )
     text, _ = client.chat_chain(messages, models=models, max_tokens=max_tokens, temperature=temperature)
     return text
