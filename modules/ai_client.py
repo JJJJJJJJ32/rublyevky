@@ -22,9 +22,13 @@ modules/ai_client.py — единый клиент ИИ через Cloudflare Wo
 import json
 import os
 import re
+import socket
+import ssl
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
+from urllib.parse import urlparse
 
 import requests
 from dotenv import load_dotenv
@@ -102,6 +106,151 @@ def direct_available():
 
 def _direct_base():
     return (os.getenv("GEMINI_API_BASE") or DIRECT_API_BASE).strip().rstrip("/")
+
+
+# ─── Рабочий адрес Cloudflare ──────────────────────────────────────────
+# Cloudflare отдаёт на один и тот же Worker разные anycast-адреса, а
+# провайдер в РФ режет часть из них. Найденный рабочий адрес запоминаем
+# и подставляем только для имени Worker'а: TLS-имя (SNI) остаётся прежним.
+
+WORKER_PORT = 443
+_PINNED_IPS = {}
+_PIN_LOCK = threading.Lock()
+_REAL_GETADDRINFO = socket.getaddrinfo
+
+
+def _getaddrinfo_with_pin(host, port, *args, **kwargs):
+    """Подменяет только адрес Worker'а, остальные хосты идут как обычно."""
+    with _PIN_LOCK:
+        pinned = _PINNED_IPS.get(str(host).lower())
+    if pinned and port in (WORKER_PORT, None):
+        return _REAL_GETADDRINFO(pinned, port, *args, **kwargs)
+    return _REAL_GETADDRINFO(host, port, *args, **kwargs)
+
+
+def _install_addr_patch():
+    if socket.getaddrinfo is not _getaddrinfo_with_pin:
+        socket.getaddrinfo = _getaddrinfo_with_pin
+
+
+def _worker_host():
+    base = get_worker_url()
+    if not base:
+        return ""
+    return (urlparse(base).hostname or "").lower()
+
+
+def worker_ip():
+    """Адрес Cloudflare, через который сейчас ходим (или None)."""
+    with _PIN_LOCK:
+        return _PINNED_IPS.get(_worker_host())
+
+
+def _resolved_ips(host):
+    ips = []
+    try:
+        for info in _REAL_GETADDRINFO(host, WORKER_PORT, type=socket.SOCK_STREAM):
+            address = info[4][0]
+            if ":" not in address and address not in ips:
+                ips.append(address)
+    except OSError:
+        pass
+    return ips
+
+
+def _doh_ips(host):
+    """
+    Спрашивает адреса у Cloudflare DoH: DNS провайдера часто отдаёт
+    именно те адреса Cloudflare, которые у него же и заблокированы.
+    """
+    try:
+        resp = requests.get(
+            "https://cloudflare-dns.com/dns-query",
+            params={"name": host, "type": "A"},
+            headers={"accept": "application/dns-json"},
+            timeout=5,
+        )
+        if resp.status_code != 200:
+            return []
+        data = resp.json()
+        return [
+            str(item.get("data"))
+            for item in (data.get("Answer") or [])
+            if item.get("type") == 1
+        ]
+    except Exception:
+        return []
+
+
+def _ip_works(host, ip, timeout=4.0):
+    """Быстрая проверка: TLS с именем Worker'а + GET /health (он без токена)."""
+    try:
+        context = ssl.create_default_context()
+        with socket.create_connection((ip, WORKER_PORT), timeout=timeout) as raw:
+            with context.wrap_socket(raw, server_hostname=host) as tls:
+                request = (
+                    f"GET /health HTTP/1.1\r\nHost: {host}\r\n"
+                    "User-Agent: rublyevky-bot\r\nConnection: close\r\n\r\n"
+                )
+                tls.sendall(request.encode("ascii"))
+                head = tls.recv(64)
+        return head.startswith(b"HTTP/1.1 200") or head.startswith(b"HTTP/1.0 200")
+    except (OSError, ssl.SSLError, ValueError):
+        return False
+
+
+def _first_working(host, candidates, timeout):
+    """Проверяет адреса параллельно и возвращает первый отвечающий."""
+    if not candidates:
+        return None
+    with ThreadPoolExecutor(max_workers=min(8, len(candidates))) as pool:
+        results = list(pool.map(lambda ip: _ip_works(host, ip, timeout), candidates))
+    for ip, works in zip(candidates, results):
+        if works:
+            return ip
+    return None
+
+
+def ensure_worker_ip(timeout=3.0):
+    """
+    Ищет рабочий адрес Cloudflare для Worker'а и запоминает его.
+
+    Адреса проверяются параллельно, поэтому запуск не растягивается
+    на несколько таймаутов подряд. Возвращает выбранный адрес или None.
+    """
+    host = _worker_host()
+    if not host:
+        return None
+
+    candidates = _resolved_ips(host)
+    found = _first_working(host, candidates, timeout)
+    if not found:
+        # DNS провайдера часто отдаёт именно заблокированные адреса,
+        # поэтому при неудаче спрашиваем ещё и Cloudflare DoH.
+        extra = [ip for ip in _doh_ips(host) if ip not in candidates]
+        found = _first_working(host, extra, timeout)
+
+    if found:
+        with _PIN_LOCK:
+            _PINNED_IPS[host] = found
+        logger.info(f"[AI] Рабочий адрес Cloudflare: {found}")
+        return found
+
+    with _PIN_LOCK:
+        _PINNED_IPS.pop(host, None)
+    return None
+
+
+def switch_worker_ip():
+    """Перепроверяет адреса. True — если найден другой рабочий адрес."""
+    host = _worker_host()
+    with _PIN_LOCK:
+        current = _PINNED_IPS.get(host)
+    found = ensure_worker_ip()
+    return bool(found) and found != current
+
+
+_install_addr_patch()
 
 
 def _mask_proxy(proxy):
@@ -267,7 +416,14 @@ class AIClient:
         try:
             resp = self.session.get(self._url("/health"), headers=self._headers(), timeout=30)
         except requests.exceptions.RequestException as e:
-            return False, _short_network_error(e)
+            # Провайдер режет часть адресов Cloudflare — ищем рабочий и пробуем ещё раз.
+            if switch_worker_ip():
+                try:
+                    resp = self.session.get(self._url("/health"), headers=self._headers(), timeout=30)
+                except requests.exceptions.RequestException as second:
+                    return False, _short_network_error(second)
+            else:
+                return False, _short_network_error(e)
 
         if resp.status_code == 401:
             return False, "Worker отклонил токен (проверь AI_WORKER_TOKEN)"
@@ -311,7 +467,7 @@ class AIClient:
 
     # ─── Основной метод ────────────────────────────────────────────────
 
-    def chat(self, messages, model=None, max_tokens=None, temperature=None, attempts=None):
+    def chat(self, messages, model=None, max_tokens=None, temperature=None, attempts=None, _depth=0):
         """
         Один запрос к указанной модели (или к первой доступной из списка).
         Возвращает текст ответа. Бросает AIError-наследников при проблемах.
@@ -380,10 +536,21 @@ class AIClient:
                     raise
                 except (requests.exceptions.ConnectionError, requests.exceptions.Timeout) as e:
                     # Адрес один для всех моделей: если он недоступен,
-                    # перебирать модели бессмысленно. Если есть ключ Gemini —
-                    # обходим заблокированный Worker и спрашиваем Google напрямую.
+                    # перебирать модели бессмысленно. Сначала пробуем другой
+                    # адрес Cloudflare (провайдер режет часть из них), потом —
+                    # прямой Gemini, если в .env есть ключ.
                     reason = _short_network_error(e)
                     logger.info(f"[AI] Worker недоступен: {reason}")
+                    if _depth < 1 and switch_worker_ip():
+                        logger.info("[AI] Повторяю запрос через рабочий адрес Cloudflare")
+                        return self.chat(
+                            messages,
+                            model=model_name,
+                            max_tokens=max_tokens,
+                            temperature=temperature,
+                            attempts=attempts,
+                            _depth=_depth + 1,
+                        )
                     if not direct_available():
                         raise AIUnavailable(reason)
                     logger.info("[AI] Иду в Gemini API напрямую (GEMINI_API_KEY из .env)")

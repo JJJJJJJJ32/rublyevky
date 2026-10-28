@@ -459,9 +459,14 @@ def run_selftest():
     if not ai_client.client.configured:
         print("   ⚠️ Worker не настроен — пропускаем. Инструкция: README.md, раздел 4")
     else:
+        # Сначала находим рабочий адрес Cloudflare: провайдер режет часть
+        # anycast-адресов, и без этого self-test ждёт таймаут впустую.
+        ai_client.ensure_worker_ip()
         ok, info = ai_client.client.health()
         if ok:
             print(f"   ✅ Worker отвечает: {ai_client.get_worker_url()}")
+            if ai_client.worker_ip():
+                print(f"   • рабочий адрес Cloudflare: {ai_client.worker_ip()}")
             print(f"   • дата-центр Cloudflare: {info.get('colo', '?')}")
             print(f"   • версия Worker'а: {info.get('version', '?')}")
             providers = info.get("providers") or {}
@@ -476,9 +481,10 @@ def run_selftest():
             elif ai_client.get_ai_proxy():
                 print("      Прокси для ИИ задан, но Worker всё равно не ответил — проверь сам прокси.")
             else:
-                print("      Частая причина в РФ — провайдер блокирует *.workers.dev по имени хоста.")
-                print("      Варианты: 1) свой домен для Worker'а: AI_WORKER_URL=https://ai.ваш-домен")
-                print("                2) прокси: AI_PROXY_URL=http://логин:пароль@хост:порт в .env")
+                print("      Провайдер режет адреса Cloudflare: бот перебрал их, но ни один не ответил.")
+                print("      Такие волны обычно проходят за несколько минут — запустите снова позже.")
+                print("      Если не проходит: 1) прокси AI_PROXY_URL=http://логин:пароль@хост:порт")
+                print("                2) свой домен для Worker'а: AI_WORKER_URL=https://ai.ваш-домен")
                 print("                3) бесплатно: GEMINI_API_KEY=... в .env — прямой путь в Gemini")
                 problems.append(f"Worker: {info}")
 
@@ -561,6 +567,11 @@ def _preflight_ai():
     Если Worker устарел и не знает модель, бот не начинает перебирать игры:
     он печатает понятную подсказку и ждёт, пока Worker обновят.
     """
+    if ai_client.client.configured:
+        # Провайдер режет часть anycast-адресов Cloudflare: находим рабочий
+        # до первого запроса, чтобы не ждать таймаут на каждом товаре.
+        ai_client.ensure_worker_ip()
+
     missing, available = ai_client.check_model_support()
     if available and missing:
         print("   [!] Worker не знает модель(и): " + ", ".join(str(m) for m in missing))
@@ -580,7 +591,7 @@ def _preflight_ai():
 
 
 def main():
-    print("=== FUNPAY AUTO-BOT v19.11 (без Запрета, ИИ через Cloudflare Worker) ===\n")
+    print("=== FUNPAY AUTO-BOT v19.12 (без Запрета, ИИ через Cloudflare Worker) ===\n")
 
     net_session, net_ok = setup_network()
     if not net_ok:

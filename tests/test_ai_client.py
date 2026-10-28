@@ -10,6 +10,7 @@ Worker поднимаем локально: обычный HTTP-сервер и�
 
 import json
 import os
+import socket
 import sys
 import threading
 from http.server import BaseHTTPRequestHandler, HTTPServer
@@ -648,3 +649,76 @@ class TestDirectGeminiFallback:
         assert payload["systemInstruction"]["parts"][0]["text"] == "будь краток"
         assert [item["role"] for item in payload["contents"]] == ["user", "model"]
         assert payload["generationConfig"] == {"maxOutputTokens": 500, "temperature": 0.3}
+
+
+class TestWorkingCloudflareAddress:
+    """Провайдер режет часть anycast-адресов Cloudflare — бот ищет рабочий."""
+
+    def test_pin_applies_only_to_worker_host(self, monkeypatch):
+        monkeypatch.setitem(ai_client._PINNED_IPS, "worker.test", "127.0.0.1")
+
+        pinned = socket.getaddrinfo("worker.test", 443, type=socket.SOCK_STREAM)
+
+        assert {item[4][0] for item in pinned} == {"127.0.0.1"}
+        # чужой хост резолвится как обычно
+        other = socket.getaddrinfo("localhost", 80, type=socket.SOCK_STREAM)
+        assert other
+
+    def test_ensure_worker_ip_picks_first_working(self, monkeypatch):
+        monkeypatch.setenv("AI_WORKER_URL", "https://worker.test")
+        monkeypatch.setattr(ai_client, "_resolved_ips", lambda host: ["10.0.0.1", "10.0.0.2"])
+        monkeypatch.setattr(ai_client, "_doh_ips", lambda host: ["10.0.0.3"])
+        monkeypatch.setattr(ai_client, "_ip_works", lambda host, ip, timeout=4.0: ip == "10.0.0.2")
+        monkeypatch.setitem(ai_client._PINNED_IPS, "worker.test", None)
+        monkeypatch.delitem(ai_client._PINNED_IPS, "worker.test")
+
+        assert ai_client.ensure_worker_ip() == "10.0.0.2"
+        assert ai_client.worker_ip() == "10.0.0.2"
+
+    def test_ensure_worker_ip_returns_none_when_all_dead(self, monkeypatch):
+        monkeypatch.setenv("AI_WORKER_URL", "https://worker.test")
+        monkeypatch.setattr(ai_client, "_resolved_ips", lambda host: ["10.0.0.1"])
+        monkeypatch.setattr(ai_client, "_doh_ips", lambda host: [])
+        monkeypatch.setattr(ai_client, "_ip_works", lambda host, ip, timeout=4.0: False)
+
+        assert ai_client.ensure_worker_ip() is None
+        assert ai_client.worker_ip() is None
+
+    def test_switch_reports_new_address(self, monkeypatch):
+        monkeypatch.setenv("AI_WORKER_URL", "https://worker.test")
+        monkeypatch.setitem(ai_client._PINNED_IPS, "worker.test", "10.0.0.1")
+        monkeypatch.setattr(ai_client, "ensure_worker_ip", lambda timeout=4.0: "10.0.0.9")
+
+        assert ai_client.switch_worker_ip() is True
+
+    def test_switch_is_false_when_address_is_the_same(self, monkeypatch):
+        monkeypatch.setenv("AI_WORKER_URL", "https://worker.test")
+        monkeypatch.setitem(ai_client._PINNED_IPS, "worker.test", "10.0.0.1")
+        monkeypatch.setattr(ai_client, "ensure_worker_ip", lambda timeout=4.0: "10.0.0.1")
+
+        assert ai_client.switch_worker_ip() is False
+
+    def test_chat_retries_after_switching_address(self, monkeypatch):
+        calls = []
+
+        class _Session:
+            def post(self, url, **kwargs):
+                calls.append(url)
+                if len(calls) == 1:
+                    raise requests.exceptions.ConnectionError("сброс соединения")
+                return _FakeResponse(
+                    data={"choices": [{"message": {"content": "Ответ после смены IP"}}]}
+                )
+
+        monkeypatch.setenv("AI_WORKER_URL", "https://worker.test")
+        monkeypatch.setattr(ai_client, "switch_worker_ip", lambda: True)
+        client = ai_client.AIClient(
+            base_url="https://worker.test",
+            token="t",
+            session=_Session(),
+            timeout=5,
+            models=["gemini-3.6-flash"],
+        )
+
+        assert client.chat([{"role": "user", "content": "тест"}]) == "Ответ после смены IP"
+        assert len(calls) == 2
