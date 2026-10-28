@@ -480,3 +480,43 @@ class TestTimeoutIsFatal:
             )
 
         assert session.calls == 1, "после таймаута не нужно повторять тот же запрос"
+
+
+class TestAIProxy:
+    """Провайдер может блокировать *.workers.dev — тогда спасает прокси."""
+
+    def _client(self):
+        return ai_client.AIClient(base_url="http://worker.test", token="test-token")
+
+    def test_ai_proxy_url_is_applied(self, monkeypatch):
+        monkeypatch.delenv("PROXY_URL", raising=False)
+        monkeypatch.setenv("AI_PROXY_URL", "http://user:pass@proxy.local:8080")
+
+        proxies = self._client().session.proxies
+
+        assert proxies["https"] == "http://user:pass@proxy.local:8080"
+        assert proxies["http"] == "http://user:pass@proxy.local:8080"
+
+    def test_proxy_url_is_fallback(self, monkeypatch):
+        monkeypatch.delenv("AI_PROXY_URL", raising=False)
+        monkeypatch.setenv("PROXY_URL", "http://proxy.local:3128")
+
+        assert self._client().session.proxies["https"] == "http://proxy.local:3128"
+
+    def test_ai_proxy_url_wins_over_common_proxy(self, monkeypatch):
+        monkeypatch.setenv("PROXY_URL", "http://funpay-proxy:3128")
+        monkeypatch.setenv("AI_PROXY_URL", "http://ai-proxy:1080")
+
+        assert self._client().session.proxies["https"] == "http://ai-proxy:1080"
+
+    def test_without_proxy_session_goes_direct(self, monkeypatch):
+        monkeypatch.delenv("AI_PROXY_URL", raising=False)
+        monkeypatch.delenv("PROXY_URL", raising=False)
+
+        assert dict(self._client().session.proxies) == {}
+
+    def test_proxy_password_is_masked_in_logs(self):
+        assert ai_client._mask_proxy("http://user:secret@proxy.local:8080") == (
+            "http://***@proxy.local:8080"
+        )
+        assert ai_client._mask_proxy("proxy.local:8080") == "proxy.local:8080"

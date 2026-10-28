@@ -76,6 +76,27 @@ def get_worker_token():
     return (os.getenv("AI_WORKER_TOKEN") or "").strip()
 
 
+def get_ai_proxy():
+    """
+    Прокси для запросов к Worker'у.
+
+    AI_PROXY_URL важнее PROXY_URL: общий PROXY_URL обычно подбирают под FunPay,
+    и не каждый такой прокси годится для Cloudflare. Пусто — идём напрямую.
+    """
+    return (os.getenv("AI_PROXY_URL") or os.getenv("PROXY_URL") or "").strip()
+
+
+def _mask_proxy(proxy):
+    """Прячет логин и пароль прокси для вывода в консоль и лог."""
+    if "@" not in proxy:
+        return proxy
+    head, tail = proxy.rsplit("@", 1)
+    if "://" in head:
+        scheme, _ = head.split("://", 1)
+        return f"{scheme}://***@{tail}"
+    return f"***@{tail}"
+
+
 def get_model_priority():
     """
     Порядок моделей из .env (AI_MODEL_PRIORITY через запятую) или дефолтный.
@@ -114,7 +135,12 @@ class AIClient:
         if self._session is None:
             with self._session_lock:
                 if self._session is None:
-                    self._session = requests.Session()
+                    session = requests.Session()
+                    proxy = get_ai_proxy()
+                    if proxy:
+                        session.proxies.update({"http": proxy, "https": proxy})
+                        logger.info(f"[AI] Запросы к Worker'у идут через прокси {_mask_proxy(proxy)}")
+                    self._session = session
         return self._session
 
     def _url(self, path):
