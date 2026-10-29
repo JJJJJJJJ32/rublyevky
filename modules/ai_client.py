@@ -518,10 +518,21 @@ class AIClient:
                         and self.use_stream
                         and "стриминг" in (error_text or "").lower()
                     ):
-                        # Старый Worker без поддержки потока: повторяем без него.
+                        # Старый Worker без поддержки потока: сразу повторяем
+                        # обычным запросом, не тратя попытку модели.
                         self.use_stream = False
+                        payload["stream"] = False
                         logger.info("[AI] Worker не умеет стриминг — повторяю обычным запросом")
-                        continue
+                        started = time.time()
+                        resp = self.session.post(
+                            self._url("/v1/chat/completions"),
+                            headers=self._headers(),
+                            json=payload,
+                            timeout=self.timeout,
+                            stream=False,
+                        )
+                        elapsed = round(time.time() - started, 1)
+                        error_text = _extract_error(resp)
 
                     if resp.status_code == 429:
                         raise AILimitReached(error_text or "лимит ИИ исчерпан")

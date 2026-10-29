@@ -830,3 +830,22 @@ class TestStreaming:
         assert text == "обычный ответ"
         assert calls == [True, False]
         assert client.use_stream is False
+    def test_old_worker_falls_back_with_single_attempt(self):
+        responses = [
+            _FakeResponse(
+                status_code=400,
+                data={"error": {"message": "стриминг не поддерживается — убери stream или поставь false"}},
+            ),
+            _FakeResponse(data={"choices": [{"message": {"content": "ответ с одной попытки"}}]}),
+        ]
+        calls = []
+
+        class _Session:
+            def post(self, url, **kwargs):
+                calls.append(kwargs.get("stream"))
+                return responses[len(calls) - 1]
+
+        text = self._client(_Session()).chat([{"role": "user", "content": "тест"}], attempts=1)
+
+        assert text == "ответ с одной попытки"
+        assert calls == [True, False]
