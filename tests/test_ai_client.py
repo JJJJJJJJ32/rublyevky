@@ -10,11 +10,13 @@ Worker поднимаем локально: обычный HTTP-сервер и�
 
 import json
 import os
+import socket
 import sys
 import threading
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 import pytest
+import requests
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 
@@ -190,7 +192,7 @@ class TestChat:
         _, server = worker_url
         client.chat([{"role": "user", "content": "привет"}], model="@cf/openai/gpt-oss-120b")
         assert server.last_request["model"] == "@cf/openai/gpt-oss-120b"
-        assert server.last_request["stream"] is False
+        assert server.last_request["stream"] is True
 
     def test_max_tokens_passed(self, client, worker_url):
         _, server = worker_url
@@ -449,3 +451,382 @@ class TestModelSupport:
 
     def test_unknown_model_is_subclass_of_error(self):
         assert issubclass(ai_client.AIModelNotSupported, ai_client.AIError)
+
+
+class TestTimeoutIsFatal:
+    """Таймаут — это недоступность Worker'а, а не повод ждать ещё 180 секунд."""
+
+    def test_timeout_raises_unavailable_without_retry(self):
+        class _TimeoutSession:
+            def __init__(self):
+                self.calls = 0
+
+            def post(self, *args, **kwargs):
+                self.calls += 1
+                raise requests.exceptions.ReadTimeout("timed out")
+
+        session = _TimeoutSession()
+        client = ai_client.AIClient(
+            base_url="http://worker.test",
+            token="test-token",
+            session=session,
+            timeout=1,
+            models=["gemini-3.6-flash"],
+        )
+
+        with pytest.raises(ai_client.AIUnavailable):
+            client.chat(
+                [{"role": "user", "content": "тест"}],
+                model="gemini-3.6-flash",
+            )
+
+        assert session.calls == 1, "после таймаута не нужно повторять тот же запрос"
+
+
+class TestAIProxy:
+    """Провайдер может блокировать *.workers.dev — тогда спасает прокси."""
+
+    def _client(self):
+        return ai_client.AIClient(base_url="http://worker.test", token="test-token")
+
+    def test_ai_proxy_url_is_applied(self, monkeypatch):
+        monkeypatch.delenv("PROXY_URL", raising=False)
+        monkeypatch.setenv("AI_PROXY_URL", "http://user:pass@proxy.local:8080")
+
+        proxies = self._client().session.proxies
+
+        assert proxies["https"] == "http://user:pass@proxy.local:8080"
+        assert proxies["http"] == "http://user:pass@proxy.local:8080"
+
+    def test_proxy_url_is_fallback(self, monkeypatch):
+        monkeypatch.delenv("AI_PROXY_URL", raising=False)
+        monkeypatch.setenv("PROXY_URL", "http://proxy.local:3128")
+
+        assert self._client().session.proxies["https"] == "http://proxy.local:3128"
+
+    def test_ai_proxy_url_wins_over_common_proxy(self, monkeypatch):
+        monkeypatch.setenv("PROXY_URL", "http://funpay-proxy:3128")
+        monkeypatch.setenv("AI_PROXY_URL", "http://ai-proxy:1080")
+
+        assert self._client().session.proxies["https"] == "http://ai-proxy:1080"
+
+    def test_without_proxy_session_goes_direct(self, monkeypatch):
+        monkeypatch.delenv("AI_PROXY_URL", raising=False)
+        monkeypatch.delenv("PROXY_URL", raising=False)
+
+        assert dict(self._client().session.proxies) == {}
+
+    def test_proxy_password_is_masked_in_logs(self):
+        assert ai_client._mask_proxy("http://user:secret@proxy.local:8080") == (
+            "http://***@proxy.local:8080"
+        )
+        assert ai_client._mask_proxy("proxy.local:8080") == "proxy.local:8080"
+
+
+class _FakeResponse:
+    def __init__(self, status_code=200, data=None, text=""):
+        self.status_code = status_code
+        self._data = data if data is not None else {}
+        self.text = text or json.dumps(self._data)
+        self.headers = {"content-type": "application/json"}
+
+    def json(self):
+        return self._data
+
+
+class _StreamResponse:
+    """Ответ Worker'а в формате SSE."""
+
+    def __init__(self, lines, error_after=None):
+        self.status_code = 200
+        self.headers = {"content-type": "text/event-stream; charset=utf-8"}
+        self.text = ""
+        self._lines = lines
+        self._error_after = error_after
+
+    def json(self):
+        raise ValueError("это поток, а не JSON")
+
+    def iter_lines(self, decode_unicode=True):
+        for index, line in enumerate(self._lines):
+            if self._error_after is not None and index >= self._error_after:
+                raise requests.exceptions.ChunkedEncodingError("поток оборвался")
+            yield line
+        if self._error_after is not None:
+            raise requests.exceptions.ChunkedEncodingError("поток оборвался")
+
+
+class _WorkerDownGeminiSession:
+    """Worker рвёт соединение, Gemini API отвечает как настоящий."""
+
+    def __init__(self, response):
+        self.response = response
+        self.calls = []
+
+    def post(self, url, **kwargs):
+        self.calls.append((url, kwargs))
+        if url.endswith("/v1/chat/completions"):
+            raise requests.exceptions.ConnectionError("Connection aborted")
+        if url.endswith(":generateContent"):
+            return self.response
+        raise AssertionError(f"неожиданный адрес: {url}")
+
+
+class TestDirectGeminiFallback:
+    """Провайдер блокирует *.workers.dev — бот спрашивает Gemini напрямую."""
+
+    def _client(self, session):
+        return ai_client.AIClient(
+            base_url="http://worker.test",
+            token="test-token",
+            session=session,
+            timeout=5,
+            models=["gemini-3.6-flash"],
+        )
+
+    def test_worker_blocked_uses_direct_gemini(self, monkeypatch):
+        monkeypatch.setenv("GEMINI_API_KEY", "test-gemini-key")
+        session = _WorkerDownGeminiSession(
+            _FakeResponse(
+                data={
+                    "candidates": [{"content": {"parts": [{"text": "Ответ напрямую"}]}}],
+                    "usageMetadata": {"totalTokenCount": 42, "candidatesTokenCount": 7},
+                }
+            )
+        )
+
+        text = self._client(session).chat([{"role": "user", "content": "привет"}])
+
+        assert text == "Ответ напрямую"
+        urls = [url for url, _ in session.calls]
+        assert urls[0].endswith("/v1/chat/completions")
+        assert urls[1].endswith("/models/gemini-3.6-flash:generateContent")
+        headers = session.calls[1][1]["headers"]
+        assert headers["x-goog-api-key"] == "test-gemini-key"
+
+    def test_worker_blocked_without_key_reports_unavailable(self, monkeypatch):
+        monkeypatch.delenv("GEMINI_API_KEY", raising=False)
+        monkeypatch.setenv("PROXY_URL", "http://proxy.local:3128")
+        session = _WorkerDownGeminiSession(_FakeResponse())
+
+        with pytest.raises(ai_client.AIUnavailable):
+            self._client(session).chat([{"role": "user", "content": "тест"}])
+
+        assert all(url.endswith("/v1/chat/completions") for url, _ in session.calls)
+
+    def test_direct_works_even_without_worker_url(self, monkeypatch):
+        monkeypatch.setenv("GEMINI_API_KEY", "test-gemini-key")
+        session = _WorkerDownGeminiSession(
+            _FakeResponse(
+                data={"candidates": [{"content": {"parts": [{"text": "Без Worker'а"}]}}]}
+            )
+        )
+        client = ai_client.AIClient(
+            base_url="",
+            token="",
+            session=session,
+            timeout=5,
+            models=["gemini-3.6-flash"],
+        )
+
+        assert client.chat([{"role": "user", "content": "тест"}]) == "Без Worker'а"
+        assert len(session.calls) == 1
+
+    def test_direct_limit_is_reported_as_limit(self, monkeypatch):
+        monkeypatch.setenv("GEMINI_API_KEY", "test-gemini-key")
+        session = _WorkerDownGeminiSession(
+            _FakeResponse(
+                status_code=429,
+                data={"error": {"code": 429, "message": "quota exceeded"}},
+            )
+        )
+
+        with pytest.raises(ai_client.AILimitReached):
+            self._client(session).chat([{"role": "user", "content": "тест"}])
+
+    def test_direct_bad_key_is_unavailable(self, monkeypatch):
+        monkeypatch.setenv("GEMINI_API_KEY", "wrong-key")
+        session = _WorkerDownGeminiSession(
+            _FakeResponse(
+                status_code=403,
+                data={"error": {"code": 403, "message": "API key not valid"}},
+            )
+        )
+
+        with pytest.raises(ai_client.AIUnavailable) as error:
+            self._client(session).chat([{"role": "user", "content": "тест"}])
+
+        assert "GEMINI_API_KEY" in str(error.value)
+
+    def test_payload_maps_system_and_assistant_roles(self):
+        payload = ai_client.AIClient._direct_payload(
+            [
+                {"role": "system", "content": "будь краток"},
+                {"role": "user", "content": "вопрос"},
+                {"role": "assistant", "content": "ответ"},
+            ],
+            max_tokens=500,
+            temperature=0.3,
+        )
+
+        assert payload["systemInstruction"]["parts"][0]["text"] == "будь краток"
+        assert [item["role"] for item in payload["contents"]] == ["user", "model"]
+        assert payload["generationConfig"] == {"maxOutputTokens": 500, "temperature": 0.3}
+
+
+class TestWorkingCloudflareAddress:
+    """Провайдер режет часть anycast-адресов Cloudflare — бот ищет рабочий."""
+
+    def test_pin_applies_only_to_worker_host(self, monkeypatch):
+        monkeypatch.setitem(ai_client._PINNED_IPS, "worker.test", "127.0.0.1")
+
+        pinned = socket.getaddrinfo("worker.test", 443, type=socket.SOCK_STREAM)
+
+        assert {item[4][0] for item in pinned} == {"127.0.0.1"}
+        # чужой хост резолвится как обычно
+        other = socket.getaddrinfo("localhost", 80, type=socket.SOCK_STREAM)
+        assert other
+
+    def test_ensure_worker_ip_picks_first_working(self, monkeypatch):
+        monkeypatch.setenv("AI_WORKER_URL", "https://worker.test")
+        monkeypatch.setattr(ai_client, "_resolved_ips", lambda host: ["10.0.0.1", "10.0.0.2"])
+        monkeypatch.setattr(ai_client, "_doh_ips", lambda host: ["10.0.0.3"])
+        monkeypatch.setattr(ai_client, "_ip_works", lambda host, ip, timeout=4.0: ip == "10.0.0.2")
+        monkeypatch.setitem(ai_client._PINNED_IPS, "worker.test", None)
+        monkeypatch.delitem(ai_client._PINNED_IPS, "worker.test")
+
+        assert ai_client.ensure_worker_ip() == "10.0.0.2"
+        assert ai_client.worker_ip() == "10.0.0.2"
+
+    def test_ensure_worker_ip_returns_none_when_all_dead(self, monkeypatch):
+        monkeypatch.setenv("AI_WORKER_URL", "https://worker.test")
+        monkeypatch.setattr(ai_client, "_resolved_ips", lambda host: ["10.0.0.1"])
+        monkeypatch.setattr(ai_client, "_doh_ips", lambda host: [])
+        monkeypatch.setattr(ai_client, "_ip_works", lambda host, ip, timeout=4.0: False)
+
+        assert ai_client.ensure_worker_ip() is None
+        assert ai_client.worker_ip() is None
+
+    def test_switch_reports_new_address(self, monkeypatch):
+        monkeypatch.setenv("AI_WORKER_URL", "https://worker.test")
+        monkeypatch.setitem(ai_client._PINNED_IPS, "worker.test", "10.0.0.1")
+        monkeypatch.setattr(ai_client, "ensure_worker_ip", lambda timeout=4.0: "10.0.0.9")
+
+        assert ai_client.switch_worker_ip() is True
+
+    def test_switch_is_false_when_address_is_the_same(self, monkeypatch):
+        monkeypatch.setenv("AI_WORKER_URL", "https://worker.test")
+        monkeypatch.setitem(ai_client._PINNED_IPS, "worker.test", "10.0.0.1")
+        monkeypatch.setattr(ai_client, "ensure_worker_ip", lambda timeout=4.0: "10.0.0.1")
+
+        assert ai_client.switch_worker_ip() is False
+
+    def test_chat_retries_after_switching_address(self, monkeypatch):
+        calls = []
+
+        class _Session:
+            def post(self, url, **kwargs):
+                calls.append(url)
+                if len(calls) == 1:
+                    raise requests.exceptions.ConnectionError("сброс соединения")
+                return _FakeResponse(
+                    data={"choices": [{"message": {"content": "Ответ после смены IP"}}]}
+                )
+
+        monkeypatch.setenv("AI_WORKER_URL", "https://worker.test")
+        monkeypatch.setattr(ai_client, "switch_worker_ip", lambda: True)
+        client = ai_client.AIClient(
+            base_url="https://worker.test",
+            token="t",
+            session=_Session(),
+            timeout=5,
+            models=["gemini-3.6-flash"],
+        )
+
+        assert client.chat([{"role": "user", "content": "тест"}]) == "Ответ после смены IP"
+        assert len(calls) == 2
+
+
+class TestStreaming:
+    """Провайдер рвёт «молчащие» соединения через ~19 с — отвечаем потоком."""
+
+    def _client(self, session):
+        return ai_client.AIClient(
+            base_url="http://worker.test",
+            token="t",
+            session=session,
+            timeout=10,
+            models=["gemini-3.6-flash"],
+        )
+
+    def test_streaming_answer_is_assembled(self):
+        lines = [
+            'data: {"choices":[{"delta":{"content":"Привет"}}]}',
+            "",
+            'data: {"choices":[{"delta":{"content":", мир"}}]}',
+            "",
+            'data: {"choices":[],"usage":{"total_tokens":12}}',
+            "data: [DONE]",
+        ]
+        seen = {}
+
+        class _Session:
+            def post(self, url, **kwargs):
+                seen["stream"] = kwargs.get("stream")
+                return _StreamResponse(lines)
+
+        text = self._client(_Session()).chat([{"role": "user", "content": "тест"}])
+
+        assert text == "Привет, мир"
+        assert seen["stream"] is True
+
+    def test_broken_stream_keeps_partial_text(self):
+        long_part = "Длинный гайд " * 40
+        lines = [f'data: {{"choices":[{{"delta":{{"content":"{long_part}"}}}}]}}']
+        error_text = []
+
+        class _Session:
+            def post(self, url, **kwargs):
+                return _StreamResponse(lines, error_after=1)
+
+        import modules.ai_client as client_module
+
+        original = client_module.logger.log_error
+        client_module.logger.log_error = lambda message: error_text.append(message)
+        try:
+            text = self._client(_Session()).chat([{"role": "user", "content": "тест"}])
+        finally:
+            client_module.logger.log_error = original
+
+        assert text.startswith("Длинный гайд")
+        assert any("Поток оборвался" in message for message in error_text)
+
+    def test_broken_stream_without_text_is_unavailable(self):
+        class _Session:
+            def post(self, url, **kwargs):
+                return _StreamResponse([], error_after=0)
+
+        with pytest.raises(ai_client.AIUnavailable):
+            self._client(_Session()).chat([{"role": "user", "content": "тест"}])
+
+    def test_old_worker_falls_back_to_plain_request(self):
+        responses = [
+            _FakeResponse(
+                status_code=400,
+                data={"error": {"message": "стриминг не поддерживается — убери stream или поставь false"}},
+            ),
+            _FakeResponse(data={"choices": [{"message": {"content": "обычный ответ"}}]}),
+        ]
+        calls = []
+
+        class _Session:
+            def post(self, url, **kwargs):
+                calls.append(kwargs.get("stream"))
+                return responses[len(calls) - 1]
+
+        client = self._client(_Session())
+        text = client.chat([{"role": "user", "content": "тест"}])
+
+        assert text == "обычный ответ"
+        assert calls == [True, False]
+        assert client.use_stream is False

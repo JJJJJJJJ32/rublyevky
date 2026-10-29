@@ -23,9 +23,20 @@ from modules.funpay_auth import get_session
 from modules.network import setup_network, recheck_network, get_proxy_url
 from modules.lot_publisher import publish_lot, get_category_info, RESULT_SUCCESS
 from modules.duplicate_checker import is_game_processed, mark_as_processed
-from modules.category_finder import find_funpay_category
+from modules.category_finder import find_funpay_category, CategoryLookupError
 from modules.mandatory_products import select_mandatory_products
 from modules import ai_client
+
+
+# Windows: при перенаправлении вывода (файл, планировщик, IDE) консоль может
+# быть в cp1251, и print() с эмодзи падает с UnicodeEncodeError. Замена
+# непечатных символов не даёт этой ошибке попасть в обработку игры.
+for _stream in (sys.stdout, sys.stderr):
+    if hasattr(_stream, "reconfigure"):
+        try:
+            _stream.reconfigure(errors="replace")
+        except Exception:
+            pass
 
 
 def _reconnect(net_session):
@@ -177,7 +188,17 @@ def process_single_game(session, game_data, net_session):
         # Это экономит время, но не создаёт очередь из десятков запросов.
         with ThreadPoolExecutor(max_workers=1) as preparation_pool:
             ideas_future = preparation_pool.submit(_generate_ideas_timed, game_name)
-            found = find_funpay_category(session, game_name)
+            try:
+                found = find_funpay_category(session, game_name)
+            except CategoryLookupError as error:
+                # FunPay не ответил — это не «игры нет». Игру не трогаем,
+                # иначе сетевой сбой стирает data/games_list.txt.
+                print(f"   [!] Не удалось проверить игру на FunPay: {error}")
+                print("       Игра остаётся в списке — повторим позже.")
+                logger.log_error(
+                    f"Поиск раздела {game_name}: {error} — игра остаётся в списке"
+                )
+                return session, net_session
 
             if not found:
                 print(f"   [!] Игра '{game_name}' не найдена. Пропуск.")
@@ -358,10 +379,23 @@ def process_single_game(session, game_data, net_session):
     except ai_client.AILimitReached:
         # Главный цикл решает, как переждать общий лимит, не удаляя игру.
         raise
+    except ai_client.AIUnavailable as error:
+        # Worker/провайдер недоступен. Игру не трогаем, а главный цикл
+        # подождёт подольше, чтобы не долбить ИИ каждые 5 секунд.
+        print(f"   [!] ИИ недоступен: {error}")
+        print("       Игра остаётся в списке — повторим позже.")
+        logger.log_error(f"ИИ недоступен на игре {game_name}: {error} — игра остаётся в списке")
+        raise
+    except ai_client.AIError as error:
+        # Любой сбой ИИ (лимит, недоступный Worker, неизвестная модель) —
+        # не повод удалять игру: повторим её в следующем круге.
+        print(f"   [!] ИИ не ответил: {error}")
+        print("       Игра остаётся в списке — повторим позже.")
+        logger.log_error(f"ИИ не ответил на игре {game_name}: {error} — игра остаётся в списке")
     except Exception as error:
         print(f"   [!] Ошибка в игре: {error}")
-        logger.log_error(f"Ошибка обработки игры {game_name}: {error}")
-        remove_game_from_list(game_name)
+        print("       Игра остаётся в списке — повторим позже.")
+        logger.log_error(f"Ошибка обработки игры {game_name}: {error} — игра остаётся в списке")
     finally:
         if content_future is not None:
             content_future.cancel()
@@ -398,16 +432,41 @@ def run_selftest():
     print(f"   • GOOGLE_DRIVE_FOLDER_ID: {'✅ есть' if os.getenv('GOOGLE_DRIVE_FOLDER_ID') else '❌ нет'}")
     print(f"   • AI_WORKER_URL: {'✅ есть' if ai_client.get_worker_url() else '⚠️ нет (настрой Cloudflare Worker)'}")
     print(f"   • AI_WORKER_TOKEN: {'✅ есть' if ai_client.get_worker_token() else '⚠️ нет'}")
+    print(
+        "   • GEMINI_API_KEY: "
+        + (
+            "✅ есть (прямой путь, если Worker заблокирован)"
+            if ai_client.direct_available()
+            else "— нет (только через Worker)"
+        )
+    )
     print(f"   • PROXY_URL: {'✅ задан' if get_proxy_url() else '— не задан (ходим напрямую)'}")
+    print(
+        "   • AI_PROXY_URL: "
+        + (
+            "✅ задан"
+            if os.getenv("AI_PROXY_URL")
+            else (
+                "— не задан (для Worker'а берём PROXY_URL)"
+                if get_proxy_url()
+                else "— не задан (к Worker'у ходим напрямую)"
+            )
+        )
+    )
 
     # 2. Worker ИИ
     print("\n[2/5] Cloudflare Worker (ИИ)")
     if not ai_client.client.configured:
         print("   ⚠️ Worker не настроен — пропускаем. Инструкция: README.md, раздел 4")
     else:
+        # Сначала находим рабочий адрес Cloudflare: провайдер режет часть
+        # anycast-адресов, и без этого self-test ждёт таймаут впустую.
+        ai_client.ensure_worker_ip()
         ok, info = ai_client.client.health()
         if ok:
             print(f"   ✅ Worker отвечает: {ai_client.get_worker_url()}")
+            if ai_client.worker_ip():
+                print(f"   • рабочий адрес Cloudflare: {ai_client.worker_ip()}")
             print(f"   • дата-центр Cloudflare: {info.get('colo', '?')}")
             print(f"   • версия Worker'а: {info.get('version', '?')}")
             providers = info.get("providers") or {}
@@ -417,7 +476,17 @@ def run_selftest():
                 print(f"   • подсказка: {info['hint']}")
         else:
             print(f"   ❌ {info}")
-            problems.append(f"Worker: {info}")
+            if ai_client.direct_available():
+                print("      В .env есть GEMINI_API_KEY — бот пойдёт в Gemini API напрямую, без Worker'а.")
+            elif ai_client.get_ai_proxy():
+                print("      Прокси для ИИ задан, но Worker всё равно не ответил — проверь сам прокси.")
+            else:
+                print("      Провайдер режет адреса Cloudflare: бот перебрал их, но ни один не ответил.")
+                print("      Такие волны обычно проходят за несколько минут — запустите снова позже.")
+                print("      Если не проходит: 1) прокси AI_PROXY_URL=http://логин:пароль@хост:порт")
+                print("                2) свой домен для Worker'а: AI_WORKER_URL=https://ai.ваш-домен")
+                print("                3) бесплатно: GEMINI_API_KEY=... в .env — прямой путь в Gemini")
+                problems.append(f"Worker: {info}")
 
         # Модель из AI_MODEL_PRIORITY должна быть известна Worker'у.
         missing, available = ai_client.check_model_support()
@@ -498,6 +567,11 @@ def _preflight_ai():
     Если Worker устарел и не знает модель, бот не начинает перебирать игры:
     он печатает понятную подсказку и ждёт, пока Worker обновят.
     """
+    if ai_client.client.configured:
+        # Провайдер режет часть anycast-адресов Cloudflare: находим рабочий
+        # до первого запроса, чтобы не ждать таймаут на каждом товаре.
+        ai_client.ensure_worker_ip()
+
     missing, available = ai_client.check_model_support()
     if available and missing:
         print("   [!] Worker не знает модель(и): " + ", ".join(str(m) for m in missing))
@@ -517,7 +591,7 @@ def _preflight_ai():
 
 
 def main():
-    print("=== FUNPAY AUTO-BOT v19.7 (без Запрета, ИИ через Cloudflare Worker) ===\n")
+    print("=== FUNPAY AUTO-BOT v19.13 (без Запрета, ИИ через Cloudflare Worker) ===\n")
 
     net_session, net_ok = setup_network()
     if not net_ok:
@@ -555,6 +629,10 @@ def main():
             print(f"   [AI] ⚠️ Лимит ИИ исчерпан: {e}")
             print("   [AI]    Ждём 30 минут и продолжаем с этого же места.")
             time.sleep(1800)
+        except ai_client.AIUnavailable as e:
+            print(f"   [AI] ⚠️ Worker или провайдер недоступен: {e}")
+            print("   [AI]    Ждём 60 секунд и пробуем снова (игра не потеряна).")
+            time.sleep(60)
         except Exception as e:
             print(f"💥 Ошибка цикла: {e}")
             logger.log_error(f"Ошибка главного цикла: {e}")
