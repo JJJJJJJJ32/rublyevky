@@ -192,7 +192,7 @@ class TestChat:
         _, server = worker_url
         client.chat([{"role": "user", "content": "привет"}], model="@cf/openai/gpt-oss-120b")
         assert server.last_request["model"] == "@cf/openai/gpt-oss-120b"
-        assert server.last_request["stream"] is False
+        assert server.last_request["stream"] is True
 
     def test_max_tokens_passed(self, client, worker_url):
         _, server = worker_url
@@ -528,9 +528,32 @@ class _FakeResponse:
         self.status_code = status_code
         self._data = data if data is not None else {}
         self.text = text or json.dumps(self._data)
+        self.headers = {"content-type": "application/json"}
 
     def json(self):
         return self._data
+
+
+class _StreamResponse:
+    """Ответ Worker'а в формате SSE."""
+
+    def __init__(self, lines, error_after=None):
+        self.status_code = 200
+        self.headers = {"content-type": "text/event-stream; charset=utf-8"}
+        self.text = ""
+        self._lines = lines
+        self._error_after = error_after
+
+    def json(self):
+        raise ValueError("это поток, а не JSON")
+
+    def iter_lines(self, decode_unicode=True):
+        for index, line in enumerate(self._lines):
+            if self._error_after is not None and index >= self._error_after:
+                raise requests.exceptions.ChunkedEncodingError("поток оборвался")
+            yield line
+        if self._error_after is not None:
+            raise requests.exceptions.ChunkedEncodingError("поток оборвался")
 
 
 class _WorkerDownGeminiSession:
@@ -722,3 +745,88 @@ class TestWorkingCloudflareAddress:
 
         assert client.chat([{"role": "user", "content": "тест"}]) == "Ответ после смены IP"
         assert len(calls) == 2
+
+
+class TestStreaming:
+    """Провайдер рвёт «молчащие» соединения через ~19 с — отвечаем потоком."""
+
+    def _client(self, session):
+        return ai_client.AIClient(
+            base_url="http://worker.test",
+            token="t",
+            session=session,
+            timeout=10,
+            models=["gemini-3.6-flash"],
+        )
+
+    def test_streaming_answer_is_assembled(self):
+        lines = [
+            'data: {"choices":[{"delta":{"content":"Привет"}}]}',
+            "",
+            'data: {"choices":[{"delta":{"content":", мир"}}]}',
+            "",
+            'data: {"choices":[],"usage":{"total_tokens":12}}',
+            "data: [DONE]",
+        ]
+        seen = {}
+
+        class _Session:
+            def post(self, url, **kwargs):
+                seen["stream"] = kwargs.get("stream")
+                return _StreamResponse(lines)
+
+        text = self._client(_Session()).chat([{"role": "user", "content": "тест"}])
+
+        assert text == "Привет, мир"
+        assert seen["stream"] is True
+
+    def test_broken_stream_keeps_partial_text(self):
+        long_part = "Длинный гайд " * 40
+        lines = [f'data: {{"choices":[{{"delta":{{"content":"{long_part}"}}}}]}}']
+        error_text = []
+
+        class _Session:
+            def post(self, url, **kwargs):
+                return _StreamResponse(lines, error_after=1)
+
+        import modules.ai_client as client_module
+
+        original = client_module.logger.log_error
+        client_module.logger.log_error = lambda message: error_text.append(message)
+        try:
+            text = self._client(_Session()).chat([{"role": "user", "content": "тест"}])
+        finally:
+            client_module.logger.log_error = original
+
+        assert text.startswith("Длинный гайд")
+        assert any("Поток оборвался" in message for message in error_text)
+
+    def test_broken_stream_without_text_is_unavailable(self):
+        class _Session:
+            def post(self, url, **kwargs):
+                return _StreamResponse([], error_after=0)
+
+        with pytest.raises(ai_client.AIUnavailable):
+            self._client(_Session()).chat([{"role": "user", "content": "тест"}])
+
+    def test_old_worker_falls_back_to_plain_request(self):
+        responses = [
+            _FakeResponse(
+                status_code=400,
+                data={"error": {"message": "стриминг не поддерживается — убери stream или поставь false"}},
+            ),
+            _FakeResponse(data={"choices": [{"message": {"content": "обычный ответ"}}]}),
+        ]
+        calls = []
+
+        class _Session:
+            def post(self, url, **kwargs):
+                calls.append(kwargs.get("stream"))
+                return responses[len(calls) - 1]
+
+        client = self._client(_Session())
+        text = client.chat([{"role": "user", "content": "тест"}])
+
+        assert text == "обычный ответ"
+        assert calls == [True, False]
+        assert client.use_stream is False

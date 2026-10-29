@@ -21,7 +21,7 @@
  *                        показывается в /health (на работу не влияет).
  */
 
-const VERSION = "1.1";
+const VERSION = "1.2";
 // gpt-oss тратит часть max_tokens на внутреннее рассуждение. Если дать ему
 // слишком маленький лимит, наружу может прийти пустой ответ.
 const MIN_OUTPUT_TOKENS = 1536;
@@ -82,6 +82,7 @@ export default {
           openrouter: Boolean(env.OPENROUTER_API_KEY),
         },
         models: availableModels(env),
+        streaming: true,
       };
       if (!env.AI) {
         health.hint = "Workers AI не подключён: добавь binding AI в Settings → Bindings";
@@ -158,9 +159,13 @@ async function handleChat(request, env) {
     return json({ error: { message: "нужен непустой массив messages", type: "bad_request" } }, 400);
   }
   if (body.stream) {
-    return json({
-      error: { message: "стриминг не поддерживается — убери stream или поставь false", type: "bad_request" },
-    }, 400);
+    // Стриминг поддерживают только внешние провайдеры (Gemini, OpenRouter, Groq).
+    // Он нужен, когда провайдер рвёт долгие «молчащие» соединения.
+    if (model.startsWith("@cf/")) {
+      return json({
+        error: { message: "Cloudflare-модели не поддерживают стриминг — используй gemini-*", type: "bad_request" },
+      }, 400);
+    }
   }
 
   // 1) Модели самого Cloudflare
@@ -178,6 +183,7 @@ async function handleChat(request, env) {
       key: env.OPENROUTER_API_KEY,
       remoteModel: model.slice("openrouter/".length),
       body,
+      stream: Boolean(body.stream),
       headers: { "HTTP-Referer": "https://workers.dev", "X-Title": "funpay-bot" },
     });
   }
@@ -197,7 +203,7 @@ async function handleChat(request, env) {
       error: { message: `для модели "${model}" нужен секрет ${cfg.key} — добавь его в настройках Worker'а`, type: "no_key" },
     }, 400);
   }
-  return proxyUpstream({ url: cfg.url, key: env[cfg.key], remoteModel: cfg.remote || model, body });
+  return proxyUpstream({ url: cfg.url, key: env[cfg.key], remoteModel: cfg.remote || model, body, stream: Boolean(body.stream) });
 }
 
 async function runCloudflareModel(model, body, env) {
@@ -237,11 +243,11 @@ async function runCloudflareModel(model, body, env) {
   }
 }
 
-async function proxyUpstream({ url, key, remoteModel, body, headers = {} }) {
+async function proxyUpstream({ url, key, remoteModel, body, headers = {}, stream = false }) {
   const payload = {
     model: remoteModel,
     messages: body.messages,
-    stream: false,
+    stream: Boolean(stream),
   };
   if (body.max_tokens) payload.max_tokens = body.max_tokens;
   if (body.temperature !== undefined) payload.temperature = body.temperature;
@@ -261,8 +267,23 @@ async function proxyUpstream({ url, key, remoteModel, body, headers = {} }) {
     return json({ error: { message: "не смог дозвониться до провайдера: " + e.message, type: "upstream_unreachable" } }, 502);
   }
 
+  const contentType = response.headers.get("content-type") || "";
+
+  // Поток отдаём как есть: соединение с ботом не простаивает, поэтому
+  // провайдерские обрывы «долгих молчащих» соединений его не рвут.
+  if (stream && response.ok && contentType.includes("text/event-stream")) {
+    return new Response(response.body, {
+      status: 200,
+      headers: {
+        "content-type": "text/event-stream; charset=utf-8",
+        "cache-control": "no-cache",
+        "x-worker-version": VERSION,
+      },
+    });
+  }
+
   const text = await response.text();
-  const isJson = (response.headers.get("content-type") || "").includes("application/json");
+  const isJson = contentType.includes("application/json");
 
   if (response.ok && isJson) {
     try {

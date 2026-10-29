@@ -289,6 +289,9 @@ class AIClient:
         self.models = list(models or get_model_priority())
         self._session = session
         self._session_lock = threading.Lock()
+        # Стриминг: провайдер режет «молчащие» соединения через ~19 с,
+        # а с потоком байты идут всё время генерации и обрыва нет.
+        self.use_stream = (os.getenv("AI_STREAM", "1").strip() != "0")
 
     # ─── Служебное ─────────────────────────────────────────────────────
 
@@ -491,7 +494,7 @@ class AIClient:
                 payload = {
                     "model": model_name,
                     "messages": messages,
-                    "stream": False,
+                    "stream": self.use_stream,
                 }
                 if max_tokens:
                     payload["max_tokens"] = max_tokens
@@ -505,18 +508,49 @@ class AIClient:
                         headers=self._headers(),
                         json=payload,
                         timeout=self.timeout,
+                        stream=self.use_stream,
                     )
                     elapsed = round(time.time() - started, 1)
 
+                    error_text = _extract_error(resp)
+                    if (
+                        resp.status_code == 400
+                        and self.use_stream
+                        and "стриминг" in (error_text or "").lower()
+                    ):
+                        # Старый Worker без поддержки потока: повторяем без него.
+                        self.use_stream = False
+                        logger.info("[AI] Worker не умеет стриминг — повторяю обычным запросом")
+                        continue
+
                     if resp.status_code == 429:
-                        raise AILimitReached(_extract_error(resp) or "лимит ИИ исчерпан")
+                        raise AILimitReached(error_text or "лимит ИИ исчерпан")
                     if resp.status_code == 401:
                         raise AIUnavailable("Worker отклонил токен (AI_WORKER_TOKEN)")
                     if resp.status_code >= 500:
-                        raise AIUnavailable(f"Worker вернул {resp.status_code}: {_extract_error(resp)}")
+                        raise AIUnavailable(f"Worker вернул {resp.status_code}: {error_text}")
                     if resp.status_code != 200:
-                        last_error = _model_error(model_name, resp.status_code, _extract_error(resp))
+                        last_error = _model_error(model_name, resp.status_code, error_text)
                         break  # смысла повторять ту же модель нет, идём к следующей
+
+                    if "text/event-stream" in (resp.headers.get("content-type") or "").lower():
+                        text, usage, broken = _read_stream(resp)
+                        elapsed = round(time.time() - started, 1)
+                        if broken is not None:
+                            logger.log_error(
+                                f"[AI] Поток оборвался после {len(text)} симв.: "
+                                f"{_short_network_error(broken)}"
+                            )
+                            if len(text) < 200:
+                                raise AIUnavailable(_short_network_error(broken))
+                        if not text:
+                            last_error = AIError(f"{model_name}: пустой ответ")
+                            continue
+                        _log_usage(model_name, usage, elapsed, len(text))
+                        logger.info(
+                            f"[AI] {model_name} ответила потоком за {elapsed} с ({len(text)} симв.)"
+                        )
+                        return text
 
                     data = resp.json()
                     text = _extract_text(data)
@@ -658,6 +692,45 @@ def _extract_text(data):
     except Exception:
         pass
     return ""
+
+
+def _read_stream(resp):
+    """
+    Собирает текст из SSE-потока Worker'а (формат OpenAI).
+
+    Возвращает (текст, usage, ошибка). Если поток оборвался посередине,
+    ошибка не теряет уже полученный текст: длинный гайд можно спасти.
+    """
+    parts = []
+    usage = None
+    error = None
+    try:
+        for raw in resp.iter_lines(decode_unicode=True):
+            if not raw:
+                continue
+            line = raw.strip()
+            if not line.startswith("data:"):
+                continue
+            chunk = line[5:].strip()
+            if not chunk or chunk == "[DONE]":
+                continue
+            try:
+                data = json.loads(chunk)
+            except ValueError:
+                continue
+            usage = data.get("usage") or usage
+            for choice in data.get("choices") or []:
+                delta = choice.get("delta") or {}
+                piece = delta.get("content")
+                if isinstance(piece, list):
+                    piece = "".join(
+                        part.get("text", "") for part in piece if isinstance(part, dict)
+                    )
+                if isinstance(piece, str) and piece:
+                    parts.append(piece)
+    except requests.exceptions.RequestException as exc:
+        error = exc
+    return "".join(parts), usage, error
 
 
 def _extract_gemini_text(data):

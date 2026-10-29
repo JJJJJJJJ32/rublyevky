@@ -350,7 +350,10 @@ def ai_generate_product_ideas(game_name):
             continue
         match = re.search(r"\[\s*\{.*\}\s*\]", response, re.DOTALL)
         if not match:
-            logger.info("В ответе ИИ нет JSON-массива идей, пробуем ещё раз")
+            logger.log_error(
+                f"Ответ ИИ без JSON-массива идей ({len(response)} симв.): "
+                f"{response[:300]!r}"
+            )
             continue
         try:
             data = json.loads(match.group(0))
