@@ -313,6 +313,32 @@ def _ask(messages, max_tokens=None, temperature=None):
         return None
 
 
+def _parse_ideas_json(response):
+    """
+    Достаёт идеи из ответа, даже если модель обернула JSON в текст или
+    не закрыла массив: разбираем по одному объекту и берём целые.
+    """
+    ideas = []
+    index = 0
+    decoder = json.JSONDecoder()
+    while index < len(response):
+        start = response.find("{", index)
+        if start == -1:
+            break
+        try:
+            item, end = decoder.raw_decode(response, start)
+        except ValueError:
+            index = start + 1
+            continue
+        if isinstance(item, dict) and isinstance(item.get("title"), str) and item["title"].strip():
+            points = item.get("content_points")
+            if isinstance(points, list):
+                item["content_points"] = [p for p in points if isinstance(p, str) and p.strip()]
+            ideas.append(item)
+        index = max(end, start + 1)
+    return ideas
+
+
 def ai_generate_product_ideas(game_name):
     """Генерирует 12 виральных идей на РУССКОМ языке."""
     prompt = f"""Ты помогаешь продавцу сделать полезный раздел магазина по игре «{game_name}».
@@ -343,25 +369,27 @@ def ai_generate_product_ideas(game_name):
   }}
 ]"""
 
+    best = []
     for attempt in range(2):
         logger.info(f"Генерация идей товаров: попытка {attempt + 1}/2")
         response = _ask([{"role": "user", "content": prompt}], max_tokens=1800)
         if not response:
             continue
-        match = re.search(r"\[\s*\{.*\}\s*\]", response, re.DOTALL)
-        if not match:
+        data = _parse_ideas_json(response)
+        if len(data) > len(best):
+            best = data
+        if len(data) >= 5:
+            return data
+        if data:
+            logger.info(f"Идей мало ({len(data)}), пробуем ещё раз")
+        else:
             logger.log_error(
-                f"Ответ ИИ без JSON-массива идей ({len(response)} симв.): "
+                f"Ответ ИИ без единой идеи ({len(response)} симв.): "
                 f"{response[:300]!r}"
             )
-            continue
-        try:
-            data = json.loads(match.group(0))
-            if len(data) >= 5:
-                return data
-            logger.info(f"Идей мало ({len(data)}), пробуем ещё раз")
-        except ValueError:
-            logger.info("Ответ не разобрался как JSON, пробуем ещё раз")
+    if len(best) >= 3:
+        logger.info(f"Идей получено меньше плана ({len(best)}), берём что есть")
+        return best
     logger.info("Идеи получить не удалось — будут только обязательные товары")
     return []
 
