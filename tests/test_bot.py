@@ -270,6 +270,74 @@ class TestFunPayErrors:
 
 
 # ═══════════════════════════════════════════════════════════════════════
+# 5b. publish_lot собирает все поля без исключений (регрессия v19.15)
+# ═══════════════════════════════════════════════════════════════════════
+
+class _FakeResponse:
+    def __init__(self, text="", status_code=200, payload=None):
+        self.text = text
+        self.status_code = status_code
+        self._payload = payload or {}
+
+    def json(self):
+        return self._payload
+
+
+class _FakeSession:
+    """Отдаёт форму лота и принимает сохранение как настоящий FunPay."""
+
+    FORM = (
+        "<html><body data-app-data='{\"csrf-token\": \"tok\"}'>"
+        "<input type='hidden' name='hidden_field' value='1'>"
+        "<input name='fields[summary][ru]' value=''>"
+        "<input name='fields[summary][en]' value=''>"
+        "<input name='fields[desc][ru]' value=''>"
+        "<input name='fields[desc][en]' value=''>"
+        "<input name='fields[payment_msg][ru]' value=''>"
+        "<input name='fields[payment_msg][en]' value=''>"
+        "</body></html>"
+    )
+
+    def __init__(self):
+        self.payload = None
+
+    def get(self, url, **kwargs):
+        return _FakeResponse(self.FORM)
+
+    def post(self, url, **kwargs):
+        self.payload = kwargs.get("data") or {}
+        return _FakeResponse(payload={"done": True})
+
+
+def test_publish_lot_fills_english_payment_message_with_link():
+    """Английское сообщение раньше падало без ссылки и лот не публиковался."""
+    from modules.lot_publisher import publish_lot
+    from modules.description_builder import (
+        generate_full_description_ruble,
+        generate_short_description_ruble,
+        generate_payment_message,
+    )
+
+    link = "https://drive.google.com/file/d/test/view"
+    session = _FakeSession()
+    game = {"game_id": 42}
+    idea = {"title": "ФАРМ РЕСУРСОВ", "content_points": ["Первый шаг"]}
+
+    result = publish_lot(
+        session,
+        game,
+        generate_short_description_ruble(idea["title"]),
+        generate_full_description_ruble(idea, "Тестовая игра"),
+        generate_payment_message(link),
+        1,
+    )
+
+    assert result == "success"
+    assert link in session.payload["fields[payment_msg][en]"]
+
+
+
+# ═══════════════════════════════════════════════════════════════════════
 # 6. Config limits — проверка что лимиты адекватные
 # ═══════════════════════════════════════════════════════════════════════
 

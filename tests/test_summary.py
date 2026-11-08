@@ -306,3 +306,8 @@ def test_english_fields_are_built_locally_within_limits():
     payment = generate_payment_message_en("https://example.test/file")
     assert len(payment) >= LIMITS["payment_msg_min_en"]
     assert all(ord(char) < 128 for char in payment)
+
+    # Без ссылки функция не должна падать: раньше это ломало publish_lot.
+    payment_without_link = generate_payment_message_en()
+    assert len(payment_without_link) >= LIMITS["payment_msg_min_en"]
+    assert all(ord(char) < 128 for char in payment_without_link)

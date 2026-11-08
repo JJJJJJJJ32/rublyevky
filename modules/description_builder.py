@@ -513,10 +513,17 @@ def generate_full_description_en():
     )
 
 
-def generate_payment_message_en(link):
-    """Английское сообщение покупателю (минимум 300 символов для FunPay)."""
+def generate_payment_message_en(link=""):
+    """Английское сообщение покупателю (минимум 300 символов для FunPay).
+
+    Ссылка необязательна: если её не передали, строка про товар всё равно
+    остаётся, иначе сообщение выглядело бы оборванным.
+    """
+    first_line = "Hi! Thanks for your purchase."
+    if link:
+        first_line = f"Hi! Thanks for your purchase. Your product is here: {link}"
     return (
-        f"Hi! Thanks for your purchase. Your product is here: {link}\n\n"
+        f"{first_line}\n\n"
         "The file is available right away, 24/7. Save this message: the link stays "
         "active and you can open it again at any time. Inside you will find the full "
         "guide with step by step instructions, exact values and alternative options.\n\n"

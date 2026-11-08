@@ -111,6 +111,12 @@ def _fill_select(payload, name, select_tag):
     payload[name] = non_empty[0][0]
 
 
+def _extract_link(payment_message):
+    """Достаёт ссылку из русского сообщения покупателю для английской версии."""
+    match = re.search(r"https?://\S+", str(payment_message or ""))
+    return match.group(0) if match else ""
+
+
 def publish_lot(session, game_data, short_description, full_description, payment_message, price):
     try:
         node_id = str(game_data['game_id'])
@@ -126,8 +132,14 @@ def publish_lot(session, game_data, short_description, full_description, payment
         f_en = enforce_limits(generate_full_description_en(), LIMITS['description_min_en'], 3000, is_en=True)
         # Русский description: без изменений
         f_ru = full_description
-        # Английский payment_msg: минимум 300 символов
-        p_en = enforce_limits(generate_payment_message_en(), LIMITS.get('payment_msg_min_en', 300), LIMITS['payment_msg_max'], is_en=True)
+        # Английский payment_msg: минимум 300 символов, ссылка берётся из
+        # русского сообщения, чтобы покупатель получил её и в английском поле.
+        p_en = enforce_limits(
+            generate_payment_message_en(_extract_link(payment_message)),
+            LIMITS.get('payment_msg_min_en', 300),
+            LIMITS['payment_msg_max'],
+            is_en=True,
+        )
         
         resp = session.get(edit_url, timeout=25)
         
