@@ -501,7 +501,7 @@ def run_selftest():
         elif available:
             print(
                 "   • модель "
-                + ", ".join(str(m) for m in ai_client.get_model_priority())
+                + ", ".join(str(m) for m in ai_client.get_model_chain())
                 + ": ✅ поддерживается Worker'ом"
             )
 
@@ -585,13 +585,13 @@ def _preflight_ai():
     if available:
         logger.info(
             "Worker знает модели из цепочки: "
-            + ", ".join(str(m) for m in ai_client.get_model_priority())
+            + ", ".join(str(m) for m in ai_client.get_model_chain())
         )
     return True
 
 
 def main():
-    print("=== FUNPAY AUTO-BOT v19.13 (без Запрета, ИИ через Cloudflare Worker) ===\n")
+    print("=== FUNPAY AUTO-BOT v19.14 (без Запрета, ИИ через Cloudflare Worker) ===\n")
 
     net_session, net_ok = setup_network()
     if not net_ok:
@@ -626,7 +626,8 @@ def main():
             print("\n⏹ Остановлено пользователем.")
             break
         except ai_client.AILimitReached as e:
-            print(f"   [AI] ⚠️ Лимит ИИ исчерпан: {e}")
+            print(f"   [AI] ⚠️ Лимит ИИ исчерпан на всех моделях: {e}")
+            print("   [AI]    У бесплатного Gemini дневной лимит (у flash — 20 запросов).")
             print("   [AI]    Ждём 30 минут и продолжаем с этого же места.")
             time.sleep(1800)
         except ai_client.AIUnavailable as e:

@@ -21,7 +21,7 @@
  *                        показывается в /health (на работу не влияет).
  */
 
-const VERSION = "1.2";
+const VERSION = "1.3";
 // gpt-oss тратит часть max_tokens на внутреннее рассуждение. Если дать ему
 // слишком маленький лимит, наружу может прийти пустой ответ.
 const MIN_OUTPUT_TOKENS = 1536;
@@ -251,6 +251,10 @@ async function proxyUpstream({ url, key, remoteModel, body, headers = {}, stream
   };
   if (body.max_tokens) payload.max_tokens = body.max_tokens;
   if (body.temperature !== undefined) payload.temperature = body.temperature;
+  // Gemini тратит max_tokens и на «размышления»: при длинном гайде бюджет
+  // кончается на первых строках (finish_reason=length). Передаём уровень
+  // рассуждений, чтобы бот мог его уменьшить.
+  if (body.reasoning_effort) payload.reasoning_effort = body.reasoning_effort;
 
   let response;
   try {

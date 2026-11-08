@@ -40,9 +40,18 @@ load_dotenv()
 # ─── Настройки ─────────────────────────────────────────────────────────
 # Рабочий сценарий использует только Gemini. Модель вызывается через твой
 # Cloudflare Worker по HTTP: Gemini SDK в боте нет и не нужен, ключ лежит
-# в секретах Worker'а. Подменять Gemini другой моделью нельзя.
+# в секретах Worker'а. Другие провайдеры не подключаются, но модели Gemini
+# можно менять местами: у каждой свой дневной лимит.
 DEFAULT_MODELS = [
     "gemini-3.6-flash",
+]
+
+# У каждой модели Gemini свой дневной лимит на бесплатном тарифе: у flash он
+# маленький (20 запросов в день), у lite — заметно больше. Когда основная
+# модель отвечает 429, бот продолжает на lite, а не встаёт до полуночи.
+RESERVE_MODELS = [
+    "gemini-3.5-flash-lite",
+    "gemini-3.1-flash-lite",
 ]
 
 REQUEST_TIMEOUT = int(os.getenv("AI_TIMEOUT", "180"))   # секунды на один запрос
@@ -276,6 +285,22 @@ def get_model_priority():
     return models or list(DEFAULT_MODELS)
 
 
+def get_model_chain():
+    """
+    Рабочие модели + lite-резерв на случай дневного лимита.
+
+    Лимиты у моделей Gemini разные, поэтому после 429 на основной модели
+    бот пробует lite: так он продолжает работать, а не ждёт сутки.
+    """
+    chain = list(get_model_priority())
+    if not any(model.startswith("gemini-") for model in chain):
+        return chain
+    for reserve in RESERVE_MODELS:
+        if reserve not in chain:
+            chain.append(reserve)
+    return chain
+
+
 class AIClient:
     """
     Клиент к Worker'у. Совместим с форматом OpenAI:
@@ -286,12 +311,19 @@ class AIClient:
         self.base_url = (base_url if base_url is not None else get_worker_url()).rstrip("/")
         self.token = token if token is not None else get_worker_token()
         self.timeout = timeout or REQUEST_TIMEOUT
-        self.models = list(models or get_model_priority())
+        self.models = list(models or get_model_chain())
         self._session = session
         self._session_lock = threading.Lock()
-        # Стриминг: провайдер режет «молчащие» соединения через ~19 с,
-        # а с потоком байты идут всё время генерации и обрыва нет.
-        self.use_stream = (os.getenv("AI_STREAM", "1").strip() != "0")
+        # Поток по умолчанию выключен: с отключёнными «рассуждениями» ответ
+        # приходит за секунды, а SSE через Worker иногда обрывается на
+        # середине. Включается через AI_STREAM=1, если провайдер рвёт
+        # долгие молчащие соединения.
+        self.use_stream = (os.getenv("AI_STREAM", "0").strip() == "1")
+        # Gemini тратит бюджет max_tokens и на «размышления»: при длинном
+        # гайде ответ обрывался на первых строках (finish_reason=length).
+        # minimal почти отключает рассуждения, и текст приходит целиком.
+        effort = (os.getenv("AI_REASONING_EFFORT", "minimal") or "").strip().lower()
+        self.reasoning_effort = "" if effort in ("", "0", "off", "default", "auto") else effort
 
     # ─── Служебное ─────────────────────────────────────────────────────
 
@@ -500,6 +532,8 @@ class AIClient:
                     payload["max_tokens"] = max_tokens
                 if temperature is not None:
                     payload["temperature"] = temperature
+                if self.reasoning_effort:
+                    payload["reasoning_effort"] = self.reasoning_effort
 
                 try:
                     started = time.time()
@@ -569,6 +603,13 @@ class AIClient:
                         last_error = AIError(f"{model_name}: пустой ответ")
                         continue
 
+                    choice = (data.get("choices") or [{}])[0]
+                    if choice.get("finish_reason") == "length":
+                        logger.log_error(
+                            f"[AI] {model_name}: ответ обрезан по max_tokens "
+                            f"({len(text)} симв.) — модель потратила бюджет на рассуждения"
+                        )
+
                     _log_usage(model_name, data.get("usage"), elapsed, len(text))
                     # Время, модель и объём ответа — только в logs/ai_usage.jsonl
                     # и logs/errors.log. В обычной консоли этого нет.
@@ -586,8 +627,19 @@ class AIClient:
                     # прямой Gemini, если в .env есть ключ.
                     reason = _short_network_error(e)
                     logger.info(f"[AI] Worker недоступен: {reason}")
-                    if _depth < 1 and switch_worker_ip():
-                        logger.info("[AI] Повторяю запрос через рабочий адрес Cloudflare")
+                    # Сброс на TLS-рукопожатии часто разовый: один повтор
+                    # на том же/новом адресе почти всегда проходит.
+                    resets = isinstance(e, requests.exceptions.ConnectionError)
+                    if resets and _depth < 1:
+                        try:
+                            address = ensure_worker_ip()
+                        except Exception:
+                            address = None
+                        if address:
+                            logger.info(f"[AI] Повторяю запрос через {address}")
+                        else:
+                            logger.info("[AI] Повторяю запрос к Worker'у")
+                        time.sleep(1.5)
                         return self.chat(
                             messages,
                             model=model_name,
@@ -635,12 +687,13 @@ class AIClient:
                         f"Пробуем следующую модель {chain[index + 1]}"
                     )
                     continue
-                # Цепочка из одного элемента: подменять модель нельзя,
-                # поэтому отдаём понятную ошибку наверх.
+                # Цепочка закончилась: дневной лимит исчерпан у всех моделей,
+                # включая lite-резерв.
                 raise AILimitReached(
                     f"модель {model_name} ответила лимитом (429): {e}. "
-                    "Запасных моделей в цепочке нет — дождитесь сброса лимита "
-                    "или проверьте квоту провайдера."
+                    "Лимит исчерпан у всех моделей цепочки — дождитесь сброса "
+                    "квоты (у бесплатного Gemini это сутки) или добавьте "
+                    "AI_MODEL_PRIORITY с другой моделью."
                 ) from e
             except AIUnavailable:
                 # Адрес Worker'а один для всех моделей: если он совсем

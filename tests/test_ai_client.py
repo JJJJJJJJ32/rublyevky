@@ -192,12 +192,25 @@ class TestChat:
         _, server = worker_url
         client.chat([{"role": "user", "content": "привет"}], model="@cf/openai/gpt-oss-120b")
         assert server.last_request["model"] == "@cf/openai/gpt-oss-120b"
-        assert server.last_request["stream"] is True
+        assert server.last_request["stream"] is False
 
     def test_max_tokens_passed(self, client, worker_url):
         _, server = worker_url
         client.chat([{"role": "user", "content": "привет"}], model="m", max_tokens=123)
         assert server.last_request["max_tokens"] == 123
+
+    def test_reasoning_effort_is_minimal_by_default(self, client, worker_url):
+        """Gemini тратит max_tokens и на рассуждения — иначе гайд обрывается."""
+        _, server = worker_url
+        client.chat([{"role": "user", "content": "привет"}], model="gemini-3.6-flash")
+        assert server.last_request["reasoning_effort"] == "minimal"
+
+    def test_reasoning_effort_can_be_disabled(self, monkeypatch, worker_url):
+        url, server = worker_url
+        monkeypatch.setenv("AI_REASONING_EFFORT", "off")
+        c = ai_client.AIClient(base_url=url, token="test-token", timeout=10)
+        c.chat([{"role": "user", "content": "привет"}], model="gemini-3.6-flash")
+        assert "reasoning_effort" not in server.last_request
 
     def test_no_url_raises_unavailable(self):
         c = ai_client.AIClient(base_url="", token="")
@@ -586,6 +599,8 @@ class TestDirectGeminiFallback:
 
     def test_worker_blocked_uses_direct_gemini(self, monkeypatch):
         monkeypatch.setenv("GEMINI_API_KEY", "test-gemini-key")
+        monkeypatch.setattr(ai_client, "ensure_worker_ip", lambda timeout=3.0: None)
+        monkeypatch.setattr(ai_client.time, "sleep", lambda seconds: None)
         session = _WorkerDownGeminiSession(
             _FakeResponse(
                 data={
@@ -600,13 +615,16 @@ class TestDirectGeminiFallback:
         assert text == "Ответ напрямую"
         urls = [url for url, _ in session.calls]
         assert urls[0].endswith("/v1/chat/completions")
-        assert urls[1].endswith("/models/gemini-3.6-flash:generateContent")
-        headers = session.calls[1][1]["headers"]
+        assert all(url.endswith("/v1/chat/completions") for url in urls[:-1])
+        assert urls[-1].endswith("/models/gemini-3.6-flash:generateContent")
+        headers = session.calls[-1][1]["headers"]
         assert headers["x-goog-api-key"] == "test-gemini-key"
 
     def test_worker_blocked_without_key_reports_unavailable(self, monkeypatch):
         monkeypatch.delenv("GEMINI_API_KEY", raising=False)
         monkeypatch.setenv("PROXY_URL", "http://proxy.local:3128")
+        monkeypatch.setattr(ai_client, "ensure_worker_ip", lambda timeout=3.0: None)
+        monkeypatch.setattr(ai_client.time, "sleep", lambda seconds: None)
         session = _WorkerDownGeminiSession(_FakeResponse())
 
         with pytest.raises(ai_client.AIUnavailable):
@@ -734,7 +752,8 @@ class TestWorkingCloudflareAddress:
                 )
 
         monkeypatch.setenv("AI_WORKER_URL", "https://worker.test")
-        monkeypatch.setattr(ai_client, "switch_worker_ip", lambda: True)
+        monkeypatch.setattr(ai_client, "ensure_worker_ip", lambda timeout=3.0: "10.0.0.9")
+        monkeypatch.setattr(ai_client.time, "sleep", lambda seconds: None)
         client = ai_client.AIClient(
             base_url="https://worker.test",
             token="t",
@@ -748,16 +767,20 @@ class TestWorkingCloudflareAddress:
 
 
 class TestStreaming:
-    """Провайдер рвёт «молчащие» соединения через ~19 с — отвечаем потоком."""
+    """Поток включается через AI_STREAM=1 — на случай долгих молчащих соединений."""
 
     def _client(self, session):
-        return ai_client.AIClient(
-            base_url="http://worker.test",
-            token="t",
-            session=session,
-            timeout=10,
-            models=["gemini-3.6-flash"],
-        )
+        os.environ["AI_STREAM"] = "1"
+        try:
+            return ai_client.AIClient(
+                base_url="http://worker.test",
+                token="t",
+                session=session,
+                timeout=10,
+                models=["gemini-3.6-flash"],
+            )
+        finally:
+            os.environ.pop("AI_STREAM", None)
 
     def test_streaming_answer_is_assembled(self):
         lines = [
@@ -849,3 +872,60 @@ class TestStreaming:
 
         assert text == "ответ с одной попытки"
         assert calls == [True, False]
+
+
+class TestModelChainWithReserves:
+    """Лимиты у моделей Gemini разные — после 429 работаем на lite."""
+
+    def test_default_chain_has_lite_reserve(self, monkeypatch):
+        monkeypatch.delenv("AI_MODEL_PRIORITY", raising=False)
+
+        chain = ai_client.get_model_chain()
+
+        assert chain[0] == "gemini-3.6-flash"
+        assert "gemini-3.5-flash-lite" in chain
+        assert len(chain) == len(set(chain))
+
+    def test_env_model_gets_reserves_appended(self, monkeypatch):
+        monkeypatch.setenv("AI_MODEL_PRIORITY", "gemini-3.6-flash")
+
+        chain = ai_client.get_model_chain()
+
+        assert chain[:1] == ["gemini-3.6-flash"]
+        assert "gemini-3.1-flash-lite" in chain
+
+    def test_non_gemini_models_get_no_reserves(self, monkeypatch):
+        monkeypatch.setenv("AI_MODEL_PRIORITY", "@cf/openai/gpt-oss-120b")
+
+        assert ai_client.get_model_chain() == ["@cf/openai/gpt-oss-120b"]
+
+    def test_limit_switches_to_next_model(self):
+        """429 на основной модели не должен останавливать бота."""
+        calls = []
+
+        class _Session:
+            def post(self, url, **kwargs):
+                model = kwargs["json"]["model"]
+                calls.append(model)
+                if model == "gemini-3.6-flash":
+                    return _FakeResponse(
+                        status_code=429,
+                        data={"error": {"message": "quota exceeded", "type": "ai_limit_reached"}},
+                    )
+                return _FakeResponse(
+                    data={"choices": [{"message": {"content": "ответ lite-модели"}}]}
+                )
+
+        client = ai_client.AIClient(
+            base_url="http://worker.test",
+            token="t",
+            session=_Session(),
+            timeout=5,
+            models=["gemini-3.6-flash", "gemini-3.5-flash-lite"],
+        )
+
+        text, model = client.chat_chain([{"role": "user", "content": "тест"}])
+
+        assert text == "ответ lite-модели"
+        assert model == "gemini-3.5-flash-lite"
+        assert calls == ["gemini-3.6-flash", "gemini-3.5-flash-lite"]
