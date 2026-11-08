@@ -81,16 +81,29 @@ def _template(title, index, platform="PC"):
     return templates[index]
 
 
-def test_long_title_fits_all_six_summary_styles(monkeypatch):
-    """Каждый исходный стиль должен укладываться без посимвольного мусора."""
-    for style_index in range(6):
-        monkeypatch.setattr(
-            description_builder.random,
-            "choice",
-            lambda sequence, index=style_index: sequence[index],
-        )
-        summary = generate_short_description_ruble(LONG_TITLE)
+def test_every_lot_uses_one_clean_format():
+    """Витрина единообразна: ровно один эмодзи и название, без лишнего декора."""
+    for title in (LONG_TITLE, PC_TITLE, PING_TITLE, HWID_TITLE):
+        summary = generate_short_description_ruble(title)
+
         _assert_summary_limits(summary)
+        assert description_builder._is_emoji_char(summary[0]), repr(summary)
+        assert "АВТО" not in summary
+        assert "БОНУС" not in summary
+        assert "2026" not in summary
+        emoji_count = sum(
+            1 for char in summary if description_builder._is_emoji_char(char)
+        )
+        assert emoji_count == 1, repr(summary)
+
+
+def test_clean_summary_keeps_title_words():
+    """Единый формат не должен съедать само название товара."""
+    summary = generate_short_description_ruble(PC_TITLE)
+
+    assert "МАНУАЛ" in summary
+    assert "ОПТИМИЗАЦИИ" in summary
+    assert len(summary) > 20, repr(summary)
 
 
 def test_all_six_templates_keep_useful_words_and_decoration():
