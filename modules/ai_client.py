@@ -27,7 +27,7 @@ import ssl
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from urllib.parse import urlparse
 
 import requests
@@ -54,7 +54,11 @@ RESERVE_MODELS = [
     "gemini-3.1-flash-lite",
 ]
 
-REQUEST_TIMEOUT = int(os.getenv("AI_TIMEOUT", "180"))   # секунды на один запрос
+REQUEST_TIMEOUT = int(os.getenv("AI_TIMEOUT", "90"))   # секунды на один запрос
+# Даже если в .env стоит 180, один запрос дольше 90 секунд — это почти всегда
+# зависшее соединение: ответы Gemini с отключёнными рассуждениями приходят
+# за 5–20 секунд. Ограничение не даёт игре «залипнуть» на 3–6 минут.
+MAX_REQUEST_TIMEOUT = 90
 ATTEMPTS_PER_MODEL = int(os.getenv("AI_ATTEMPTS", "2"))
 USAGE_LOG = os.path.join("logs", "ai_usage.jsonl")
 
@@ -310,10 +314,14 @@ class AIClient:
     def __init__(self, base_url=None, token=None, session=None, timeout=None, models=None):
         self.base_url = (base_url if base_url is not None else get_worker_url()).rstrip("/")
         self.token = token if token is not None else get_worker_token()
-        self.timeout = timeout or REQUEST_TIMEOUT
+        self.timeout = min(timeout or REQUEST_TIMEOUT, MAX_REQUEST_TIMEOUT)
         self.models = list(models or get_model_chain())
         self._session = session
         self._session_lock = threading.Lock()
+        # Модель, ответившая 429, какое-то время не дёргается снова: иначе
+        # каждый запрос тратит секунду на заведомо неудачную попытку.
+        self._cooldowns = {}
+        self._cooldowns_lock = threading.Lock()
         # Поток по умолчанию выключен: с отключёнными «рассуждениями» ответ
         # приходит за секунды, а SSE через Worker иногда обрывается на
         # середине. Включается через AI_STREAM=1, если провайдер рвёт
@@ -500,6 +508,35 @@ class AIClient:
             return [str(model) for model in (info.get("models") or []) if model]
         return []
 
+    # ─── Пауза для модели, исчерпавшей лимит ─────────────────────────────
+
+    def _cooldown_left(self, model_name):
+        """Сколько секунд модель ещё не будет получать запросы."""
+        with self._cooldowns_lock:
+            until = self._cooldowns.get(model_name) or 0
+        return max(0.0, until - time.time())
+
+    def _start_cooldown(self, model_name, error_text):
+        """Ставит модель на паузу после 429: сутки при дневном лимите."""
+        low = str(error_text or "").lower()
+        daily = any(
+            marker in low
+            for marker in ("per day", "per-day", "daily", "в сутки", "в день", "за сутки")
+        )
+        if daily:
+            now = datetime.now(timezone.utc)
+            reset = (now + timedelta(days=1)).replace(
+                hour=0, minute=0, second=0, microsecond=0
+            )
+            seconds = (reset - now).total_seconds() + 60
+        else:
+            seconds = 600
+        with self._cooldowns_lock:
+            self._cooldowns[model_name] = time.time() + seconds
+        logger.info(
+            f"[AI] {model_name}: пауза {int(seconds)} с после ответа 429"
+        )
+
     # ─── Основной метод ────────────────────────────────────────────────
 
     def chat(self, messages, model=None, max_tokens=None, temperature=None, attempts=None, _depth=0):
@@ -518,6 +555,13 @@ class AIClient:
         last_error = None
 
         for model_name in models:
+            cooling = self._cooldown_left(model_name)
+            if cooling:
+                # Модель недавно ответила 429 — не тратим на неё запрос.
+                last_error = AILimitReached(
+                    f"{model_name}: лимит исчерпан, пауза ещё {int(cooling)} с"
+                )
+                continue
             for attempt in range(1, attempts + 1):
                 if not self.configured:
                     # Worker'а нет вовсе — сразу идём в Gemini API.
@@ -569,6 +613,7 @@ class AIClient:
                         error_text = _extract_error(resp)
 
                     if resp.status_code == 429:
+                        self._start_cooldown(model_name, error_text)
                         raise AILimitReached(error_text or "лимит ИИ исчерпан")
                     if resp.status_code == 401:
                         raise AIUnavailable("Worker отклонил токен (AI_WORKER_TOKEN)")

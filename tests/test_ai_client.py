@@ -929,3 +929,69 @@ class TestModelChainWithReserves:
         assert text == "ответ lite-модели"
         assert model == "gemini-3.5-flash-lite"
         assert calls == ["gemini-3.6-flash", "gemini-3.5-flash-lite"]
+
+
+class TestLimitCooldown:
+    """После 429 модель не дёргается снова — иначе каждая попытка тратит время."""
+
+    def test_model_on_cooldown_is_skipped(self):
+        calls = []
+
+        class _Session:
+            def post(self, url, **kwargs):
+                calls.append(kwargs["json"]["model"])
+                return _FakeResponse(
+                    status_code=429,
+                    data={"error": {"message": "quota exceeded: limit 20 per day"}},
+                )
+
+        client = ai_client.AIClient(
+            base_url="http://worker.test",
+            token="t",
+            session=_Session(),
+            timeout=5,
+            models=["gemini-3.6-flash", "gemini-3.5-flash-lite"],
+        )
+
+        with pytest.raises(ai_client.AILimitReached):
+            client.chat_chain([{"role": "user", "content": "тест"}])
+        assert calls == ["gemini-3.6-flash", "gemini-3.5-flash-lite"]
+
+        # Обе модели на паузе: ни одного нового HTTP-запроса.
+        with pytest.raises(ai_client.AILimitReached):
+            client.chat_chain([{"role": "user", "content": "тест"}])
+        assert calls == ["gemini-3.6-flash", "gemini-3.5-flash-lite"]
+
+    def test_daily_limit_sets_long_cooldown(self):
+        class _Session:
+            def post(self, url, **kwargs):
+                return _FakeResponse(
+                    status_code=429,
+                    data={"error": {"message": "limit: 20, per day"}},
+                )
+
+        client = ai_client.AIClient(
+            base_url="http://worker.test",
+            token="t",
+            session=_Session(),
+            timeout=5,
+            models=["gemini-3.6-flash"],
+        )
+
+        with pytest.raises(ai_client.AILimitReached):
+            client.chat_chain([{"role": "user", "content": "тест"}])
+
+        # Дневной лимит — пауза заметно больше 10 минут.
+        assert client._cooldown_left("gemini-3.6-flash") > 600
+
+
+def test_request_timeout_is_capped():
+    """AI_TIMEOUT=180 не должен превращаться в 3 минуты зависания."""
+    client = ai_client.AIClient(
+        base_url="http://worker.test",
+        token="t",
+        session=object(),
+        timeout=180,
+        models=["gemini-3.6-flash"],
+    )
+    assert client.timeout == ai_client.MAX_REQUEST_TIMEOUT

@@ -4,8 +4,12 @@ import json
 import re
 import string
 from config import LIMITS
-from modules.ai_generator import ai_translate_to_en
-from modules.description_builder import fit_summary
+from modules.description_builder import (
+    fit_summary,
+    generate_short_description_en,
+    generate_full_description_en,
+    generate_payment_message_en,
+)
 from modules.logger import logger
 
 # Результаты публикации. «success» возвращается только если FunPay реально
@@ -113,16 +117,17 @@ def publish_lot(session, game_data, short_description, full_description, payment
         edit_url = f"https://funpay.com/lots/offerEdit?node={node_id}"
         save_url = "https://funpay.com/lots/offerSave"
         
-        # Переводы и лимиты. Summary сначала сокращается по словам и только
-        # потом отправляется в запрос — посимвольной обрезки заголовка нет.
-        s_en = fit_summary(ai_translate_to_en(short_description), is_en=True)
+        # Английские поля собираются локально, без запросов к ИИ: перевод
+        # каждого лота тремя запросами был самой долгой частью публикации
+        # и часто обрывался. Русское summary сокращается по целым словам.
+        s_en = fit_summary(generate_short_description_en(), is_en=True)
         s_ru = fit_summary(short_description)
         # Английский description: минимум 500 символов
-        f_en = enforce_limits(ai_translate_to_en(full_description), LIMITS['description_min_en'], 3000, is_en=True)
+        f_en = enforce_limits(generate_full_description_en(), LIMITS['description_min_en'], 3000, is_en=True)
         # Русский description: без изменений
         f_ru = full_description
         # Английский payment_msg: минимум 300 символов
-        p_en = enforce_limits(ai_translate_to_en(payment_message), LIMITS.get('payment_msg_min_en', 300), LIMITS['payment_msg_max'], is_en=True)
+        p_en = enforce_limits(generate_payment_message_en(), LIMITS.get('payment_msg_min_en', 300), LIMITS['payment_msg_max'], is_en=True)
         
         resp = session.get(edit_url, timeout=25)
         

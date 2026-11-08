@@ -11,6 +11,7 @@ modules/ai_generator.py — генерация гайдов и переводо�
 import json
 import re
 import time
+from concurrent.futures import ThreadPoolExecutor
 from functools import lru_cache
 
 from modules.logger import logger
@@ -287,13 +288,15 @@ def _postprocess_guide(text):
     return cleaned.strip()
 
 
-def _ask(messages, max_tokens=None, temperature=None):
+def _ask(messages, models=None, max_tokens=None, temperature=None):
     """
     Единая обёртка над ИИ. Ошибки не молчат — их видно в logs/errors.log,
     а в консоли остаётся только короткий итог по товару.
     """
     try:
-        return ai_client.ai_ask(messages, max_tokens=max_tokens, temperature=temperature)
+        return ai_client.ai_ask(
+            messages, models=models, max_tokens=max_tokens, temperature=temperature
+        )
     except ai_client.AILimitReached:
         raise  # дневной лимит — наверху решают, ждать или остановиться
     except ai_client.AIUnavailable as e:
@@ -311,6 +314,14 @@ def _ask(messages, max_tokens=None, temperature=None):
     except Exception as e:
         logger.log_error(f"ИИ: неожиданная ошибка {e}")
         return None
+
+
+def _future_result(future):
+    """Возвращает (результат, ошибка), не роняя вторую параллельную часть."""
+    try:
+        return future.result(), None
+    except Exception as error:  # ошибку разберём после обеих частей
+        return None, error
 
 
 def _parse_ideas_json(response):
@@ -433,12 +444,21 @@ def ai_generate_full_content(idea, game_name):
 Текст должен звучать как полезный авторский разбор, а не как рекламный шаблон.
 """
 
-    prompt_continue = (
-        "Продолжи гайд ещё на 300–400 слов. Дай новые конкретные игровые детали, "
-        "цифры, условия и порядок действий, не повторяй уже написанное. Пиши обычными "
-        "абзацами разной длины, без Markdown-заголовков, длинных рядов буллитов и "
-        "фраз «В заключение», «Итоги», «Вывод», «Таким образом», «Важно отметить» или "
-        "«Не забывайте».")
+    # Вторая часть считается одновременно с первой, начиная с lite-модели:
+    # у неё отдельный дневной лимит, и две части не выстраиваются в очередь.
+    points = [str(point) for point in (idea.get("content_points") or []) if str(point).strip()]
+    half = (len(points) + 1) // 2 if points else 0
+    focus = ", ".join(points[half:]) if half and len(points) > half else ""
+
+    prompt_extra = f"""Это вторая часть гайда по теме «{title}» для игры «{game_name}».
+Напиши 300–380 слов как продолжение для игрока, который уже прочитал базовый план:
+сразу переходи к деталям, не пересказывай основы и не начинай заново.
+Дай конкретные игровые подробности: условия, при которых приём перестаёт работать,
+частые ошибки, альтернативные варианты и порядок действий, если что-то пошло не так.
+{f"Особое внимание удели: {focus}." if focus else ""}
+Пиши обычными абзацами разной длины, без Markdown-заголовков и длинных рядов буллитов.
+Не используй фразы «В заключение», «Итоги», «Вывод», «Таким образом», «Важно отметить»
+и «Не забывайте». Не упоминай ИИ. Первое предложение начни сразу с игровой детали."""
 
     prompt_alt = f"""Опиши рабочий способ по теме «{title}» в игре «{game_name}» так, как объяснил бы
 его опытный игрок товарищу. Напиши живой подробный текст на русском языке объёмом
@@ -476,7 +496,7 @@ def ai_generate_full_content(idea, game_name):
 
 Объём — примерно 450–550 слов. Плохой общий текст без связи с игрой будет отбракован."""
 
-    def _accept(response, stage):
+    def _accept(response, stage, require_relevance=True):
         """Общая проверка ответа: очистка, отказ, длина, списки и связь с игрой."""
         if not response or len(response) < 100:
             return None
@@ -490,7 +510,7 @@ def ai_generate_full_content(idea, game_name):
         if _is_list_heavy(cleaned):
             logger.info(f"Гайд отклонён: слишком много строк-списков ({stage})")
             return None
-        if not _is_guide_relevant(
+        if require_relevance and not _is_guide_relevant(
             cleaned, game_name, title, idea.get("content_points")
         ):
             logger.info(f"Гайд отклонён: нет связи с игрой или товаром ({stage})")
@@ -501,32 +521,54 @@ def ai_generate_full_content(idea, game_name):
         """Принимает длинный текст, но не принимает список после очистки."""
         return bool(result) and not _is_list_heavy(result)
 
-    # === ПОПЫТКА 1: основной промпт, при нехватке слов — дописывание ===
+    # === ПОПЫТКА 1: две части гайда считаются параллельно ===
     # Один запрос на 700–900 слов идёт дольше 40 секунд, и соединение с
     # Worker'ом успевает оборваться. Две части по ~500 и ~350 слов
-    # приходят заметно быстрее и собираются в цельный гайд.
-    result = _accept(
-        _ask([{"role": "user", "content": prompt_main}], max_tokens=2200),
-        "основной промпт",
-    )
+    # приходят быстрее, а параллельный запуск убирает ожидание второй части.
+    chain = ai_client.get_model_chain()
+    reserve_chain = chain[1:] + chain[:1]
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        main_future = pool.submit(
+            _ask,
+            [{"role": "user", "content": prompt_main}],
+            models=chain,
+            max_tokens=2200,
+        )
+        extra_future = pool.submit(
+            _ask,
+            [{"role": "user", "content": prompt_extra}],
+            models=reserve_chain,
+            max_tokens=1800,
+        )
+        main_text, main_error = _future_result(main_future)
+        extra_text, extra_error = _future_result(extra_future)
+
+    if main_text is None and extra_text is None and (main_error or extra_error):
+        # Обе части не получились. Лимит важнее сетевой ошибки: главный цикл
+        # должен ждать сброса квоты, а не 60 секунд до повтора.
+        limit_error = next(
+            (
+                error
+                for error in (main_error, extra_error)
+                if isinstance(error, ai_client.AILimitReached)
+            ),
+            None,
+        )
+        raise limit_error or main_error or extra_error
+
+    result = _accept(main_text, "основной промпт") if main_text else None
+    extra = _accept(extra_text, "вторая часть") if extra_text else None
+    if result and extra:
+        combined = _postprocess_guide(result + "\n\n" + extra)
+        if _is_guide_good(combined) and _usable(combined):
+            logger.info(
+                f"Гайд собран параллельно ({_count_words(combined)} слов)"
+            )
+            return combined
+        if len(combined) > 500 and _usable(combined):
+            logger.info(f"Гайд получен ({_count_words(combined)} слов)")
+            return combined
     if result:
-        if _count_words(result) < 650:
-            logger.info(f"Гайд короткий ({_count_words(result)} слов). Просим дописать")
-            try:
-                more = _accept(
-                    _ask([
-                        {"role": "user", "content": prompt_main},
-                        {"role": "assistant", "content": result},
-                        {"role": "user", "content": prompt_continue},
-                    ], max_tokens=1600),
-                    "дописывание",
-                )
-            except ai_client.AIUnavailable:
-                # Первая часть уже есть — не выбрасываем её из-за обрыва связи.
-                logger.log_error("Дописывание не удалось: Worker недоступен, оставляем первую часть")
-                more = None
-            if more:
-                result = _postprocess_guide(result + "\n\n" + more)
         if _is_guide_good(result) and _usable(result):
             return result
         if len(result) > 500 and _usable(result):

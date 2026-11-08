@@ -278,7 +278,7 @@ def test_all_bad_guides_are_not_published(monkeypatch):
 
 
 def test_short_guide_is_extended_in_second_request(monkeypatch):
-    """Гайд просят двумя короткими запросами: длинный ответ обрывается по сети."""
+    """Гайд собирается двумя запросами: основная часть и продолжение."""
     part2 = (
         "Дальше по Cyberpunk 2077 проверь ещё один параметр в настройках графики: "
         "отключи трассировку лучей на слабой видеокарте и сравни FPS на том же "
@@ -287,35 +287,39 @@ def test_short_guide_is_extended_in_second_request(monkeypatch):
     calls = []
 
     def fake_ask(messages, **kwargs):
-        calls.append(messages[0]["content"])
-        return _good_guide() if len(calls) == 1 else part2
+        prompt = messages[0]["content"]
+        calls.append(prompt)
+        if "вторая часть" in prompt:
+            return part2
+        return _good_guide()
 
     monkeypatch.setattr("modules.ai_generator._ask", fake_ask)
     monkeypatch.setattr("modules.ai_generator.time.sleep", lambda seconds: None)
 
     result = ai_generate_full_content(IDEA, GAME)
 
-    assert len(calls) == 2, "короткий гайд должен дописываться вторым запросом"
+    assert len(calls) == 2, "обе части должны запрашиваться за один проход"
     assert result is not None
     assert "Дальше по Cyberpunk 2077" in result
     assert "Открой настройки Cyberpunk 2077" in result
 
 
 def test_continuation_failure_keeps_first_part(monkeypatch):
-    """Если дописывание оборвалось, уже полученная часть не выбрасывается."""
+    """Если вторая часть оборвалась, уже полученная первая не выбрасывается."""
     calls = []
 
     def fake_ask(messages, **kwargs):
-        calls.append(messages[0]["content"])
-        if len(calls) == 1:
-            return _good_guide()
-        raise ai_client.AIUnavailable("обрыв связи")
+        prompt = messages[0]["content"]
+        calls.append(prompt)
+        if "вторая часть" in prompt:
+            raise ai_client.AIUnavailable("обрыв связи")
+        return _good_guide()
 
     monkeypatch.setattr("modules.ai_generator._ask", fake_ask)
 
     result = ai_generate_full_content(IDEA, GAME)
 
-    assert len(calls) == 2
+    assert len(calls) >= 2
     assert result is not None
     assert "Открой настройки Cyberpunk 2077" in result
 
@@ -333,7 +337,8 @@ def test_unavailable_worker_stops_guide_attempts(monkeypatch):
     with pytest.raises(ai_client.AIUnavailable):
         ai_generate_full_content(IDEA, GAME)
 
-    assert len(calls) == 1
+    # Обе параллельные части упали одинаково — дальше пробовать нечего.
+    assert len(calls) == 2
 
 
 def test_ask_propagates_unavailable(monkeypatch):

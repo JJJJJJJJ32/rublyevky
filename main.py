@@ -152,21 +152,37 @@ def _print_lot_status(index, total, ok, reason=None):
 GUIDE_HEARTBEAT_SECONDS = 45.0
 
 
-def _await_content(future):
+# Сколько гайдов считать заранее. Гайд собирается из двух параллельных
+# запросов, поэтому запас в 2 товара убирает ожидание перед публикацией,
+# но не создаёт очередь из десятков запросов.
+GUIDE_PREFETCH = 3
+
+
+def _await_content(future, title=""):
     """Ждёт результат гайда и раз в GUIDE_HEARTBEAT_SECONDS печатает «всё ещё считаем».
 
     Одна короткая строка без модели, таймингов и текста гайда — только чтобы
-    было видно, что бот жив. Если гайд готов быстро, строка не печатается вовсе.
+    было видно, что бот жив и над каким товаром он работает. Если гайд готов
+    быстро, строка не печатается вовсе.
     """
     started = time.perf_counter()
     last_said = started
+    label = f" по «{_short_title(title)}»" if title else ""
     while not future.done():
         time.sleep(1.0)
         now = time.perf_counter()
         if now - last_said >= GUIDE_HEARTBEAT_SECONDS:
-            print(f"   ⏳ Гайд ещё считается ({int(now - started)} с)...")
+            print(f"   ⏳ Гайд{label} ещё считается ({int(now - started)} с)...")
             last_said = now
     return future.result()
+
+
+def _short_title(title, limit=70):
+    """Название товара для консоли: одна строка и без обрыва посреди слова."""
+    text = " ".join(str(title or "").split())
+    if len(text) <= limit:
+        return text
+    return text[:limit].rsplit(" ", 1)[0] + "…"
 
 
 def process_single_game(session, game_data, net_session):
@@ -181,7 +197,7 @@ def process_single_game(session, game_data, net_session):
         "publish_count": 0,
     }
     content_pool = None
-    content_future = None
+    pending = {}
 
     try:
         # Идеи запрашиваем сразу, одновременно с поиском раздела на FunPay.
@@ -231,29 +247,33 @@ def process_single_game(session, game_data, net_session):
 
         fail_count = 0
         guide_success = 0
-        # В фоне готовится только следующий гайд. Пока он считается, текущий
-        # файл загружается и лот публикуется. Так мы не создаём большой поток
-        # запросов и не упираемся в лимит Worker'а.
-        content_pool = ThreadPoolExecutor(max_workers=2)
+        # Гайды считаются заранее: пока текущий лот загружается и публикуется,
+        # в работе уже следующие. Каждый гайд — два параллельных запроса
+        # (основная часть и продолжение), поэтому ожидание почти не копится.
+        content_pool = ThreadPoolExecutor(max_workers=GUIDE_PREFETCH)
+
+        def _submit_guide(index):
+            pending[index] = content_pool.submit(
+                _generate_content_timed, final_ideas[index], game_name
+            )
+
+        for index in range(min(GUIDE_PREFETCH, len(final_ideas))):
+            _submit_guide(index)
 
         for i, idea in enumerate(final_ideas):
             logger.debug(f"Товар {i + 1}/{len(final_ideas)}: {idea['title']}")
+            print(f"\n🎮 Товар {i + 1}/{len(final_ideas)}: {_short_title(idea['title'])}")
 
-            if content_future is None:
-                content_future = content_pool.submit(
-                    _generate_content_timed, idea, game_name
-                )
-            content, guide_seconds = _await_content(content_future)
-            content_future = None
+            content, guide_seconds = _await_content(
+                pending.pop(i), idea["title"]
+            )
             metrics["guides"] += guide_seconds
             metrics["guide_count"] += 1
 
-            # Следующий гайд начинает считаться до загрузки и публикации текущего.
-            if i + 1 < len(final_ideas):
-                next_idea = final_ideas[i + 1]
-                content_future = content_pool.submit(
-                    _generate_content_timed, next_idea, game_name
-                )
+            # Держим в работе следующие гайды, пока публикуется текущий.
+            next_index = i + GUIDE_PREFETCH
+            if next_index < len(final_ideas):
+                _submit_guide(next_index)
 
             if not content:
                 # Плохой гайд не публикуется.
@@ -331,9 +351,8 @@ def process_single_game(session, game_data, net_session):
                     remove_game_from_list(game_name)
                     return session, net_session
 
-            # В v18.4 была пауза 3–6 секунд. Длинная пауза 7–15 секунд
-            # здесь не нужна: следующий гайд уже считается в фоне.
-            time.sleep(random.randint(3, 6))
+            # Пауза только чтобы не долбить FunPay: следующий гайд уже считается.
+            time.sleep(random.randint(1, 2))
 
         if guide_success == 0:
             # ИИ не выдал ни одного гайда (лимит, устаревший Worker, отказы).
@@ -397,9 +416,9 @@ def process_single_game(session, game_data, net_session):
         print("       Игра остаётся в списке — повторим позже.")
         logger.log_error(f"Ошибка обработки игры {game_name}: {error} — игра остаётся в списке")
     finally:
-        if content_future is not None:
-            content_future.cancel()
         if content_pool is not None:
+            for future in list(pending.values()):
+                future.cancel()
             content_pool.shutdown(wait=False, cancel_futures=True)
         _print_game_metrics(game_name, metrics)
 
@@ -591,7 +610,7 @@ def _preflight_ai():
 
 
 def main():
-    print("=== FUNPAY AUTO-BOT v19.14 (без Запрета, ИИ через Cloudflare Worker) ===\n")
+    print("=== FUNPAY AUTO-BOT v19.15 (без Запрета, ИИ через Cloudflare Worker) ===\n")
 
     net_session, net_ok = setup_network()
     if not net_ok:

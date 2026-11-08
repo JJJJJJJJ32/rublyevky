@@ -4,7 +4,10 @@ import modules.description_builder as description_builder
 from config import LIMITS
 from modules.description_builder import (
     fit_summary,
+    generate_full_description_en,
     generate_full_description_ruble,
+    generate_payment_message_en,
+    generate_short_description_en,
     generate_short_description_ruble,
 )
 
@@ -259,3 +262,47 @@ def test_summary_shortening_is_written_to_file_not_console(tmp_path, monkeypatch
     log_text = (tmp_path / "errors.log").read_text(encoding="utf-8")
     assert "summary shortened" in log_text
     assert "level=" in log_text
+
+
+def test_short_description_never_ends_with_preposition():
+    """«... ГАЙД ПО» — оборванная фраза: служебное слово снимается."""
+    title = "ПЕРВАЯ КРОВАВАЯ ЛУНА НА 7 ДЕНЬ: ГАЙД ПО ВЫЖИВАНИЮ БЕЗ ОГНЕСТРЕЛА"
+
+    for index in range(6):
+        summary = fit_summary(_template(title, index), title=title)
+        words = re.findall(r"[А-Яа-яЁёA-Za-z]+", summary)
+        assert words, repr(summary)
+        assert words[-1].lower() not in description_builder._FUNCTION_WORDS, repr(summary)
+        # Старый баг: строка заканчивалась ровно на «ГАЙД ПО».
+        assert not re.search(r"\bПО\s*[】\]\)]?\s*$", summary, re.IGNORECASE), repr(summary)
+
+
+def test_full_description_puts_emoji_before_every_point():
+    idea = {
+        "title": "ФАРМ РЕСУРСОВ",
+        "content_points": ["Первый маршрут", "Второй маршрут", "Третий маршрут"],
+    }
+    description = generate_full_description_ruble(idea, "Тестовая игра")
+
+    for point in idea["content_points"]:
+        line = next(line.strip() for line in description.splitlines() if point in line)
+        assert description_builder._is_emoji_char(line[0]), repr(line)
+
+    emoji_count = sum(
+        1 for char in description if description_builder._is_emoji_char(char)
+    )
+    assert emoji_count >= 5, "в подробном описании должно быть несколько смайликов"
+
+
+def test_english_fields_are_built_locally_within_limits():
+    summary = fit_summary(generate_short_description_en(), is_en=True)
+    assert 10 <= len(summary) <= LIMITS["summary_max"]
+    assert len(summary.encode("utf-8")) <= LIMITS["summary_max_bytes"]
+
+    description = generate_full_description_en()
+    assert len(description) >= LIMITS["description_min_en"]
+    assert all(ord(char) < 128 for char in description)
+
+    payment = generate_payment_message_en("https://example.test/file")
+    assert len(payment) >= LIMITS["payment_msg_min_en"]
+    assert all(ord(char) < 128 for char in payment)
