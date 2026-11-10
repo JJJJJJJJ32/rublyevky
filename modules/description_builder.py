@@ -1,3 +1,4 @@
+import os
 import random
 import re
 import string
@@ -150,14 +151,18 @@ def _strip_trailing_function_words(text):
                 break
         if index is None:
             return text
-        tail = re.sub(r"[^A-Za-zА-Яа-яЁё]", "", tokens[index]).lower()
-        if tail not in _FUNCTION_WORDS:
+        word = re.search(r"[A-Za-zА-Яа-яЁё]+", tokens[index])
+        if not word or word.group(0).lower() not in _FUNCTION_WORDS:
             return text
         before = " ".join(tokens[:index]).rstrip(" :;,-—–")
         if not before:
             return text
+        # Скобки и эмодзи, стоящие после служебного слова, — часть рамки:
+        # «... ФАРМА В】🟢🔰🟢» должно стать «... ФАРМА】🟢🔰🟢», а не
+        # оборваться на незакрытой «【».
+        suffix = tokens[index][word.end():]
         after = " ".join(tokens[index + 1:])
-        text = (before + (" " + after if after else "")).strip()
+        text = (before + suffix + (" " + after if after else "")).strip()
     return text
 
 
@@ -266,6 +271,8 @@ def _fit_summary(text, title=None, is_en=False, min_chars=10, max_chars=70, max_
         ready = _finalize_summary(value, is_en=is_en)
         # Хвост из предлога/союза («... ГАЙД ПО») обрезаем до смыслового слова.
         ready = _strip_trailing_function_words(ready)
+        # Обрезка служебного слова может открыть незакрытую рамку — балансируем.
+        ready = _drop_unmatched_brackets(ready)
         ready = _trim_dangling_edges(ready)
         if ready:
             candidates.append((level, ready))
@@ -352,23 +359,125 @@ def fit_summary(text, title=None, is_en=False):
     return result
 
 
-# Витрина должна выглядеть единообразно: раньше в заголовок подставлялись
-# пять случайных эмодзи и цветные кружки, из-за чего лоты выглядели как
-# разные объявления и переносились на две строки. Теперь у всех один формат:
-# один спокойный эмодзи и название.
-_TITLE_EMOJIS = ("🎮", "📘", "🚀", "⚡", "🔥", "💎", "✨", "🎯")
+# Оформление витрины. Владелец магазина выбрал образцы в духе
+# «🦊🍁『 НАЗВАНИЕ 』✧『 24/7 』🍁🦊»: парные эмодзи по краям и рамки.
+# У каждого стиля две версии — с плашкой «24/7» и без неё. Длинное название
+# вместе с плашкой не помещается в лимит FunPay, поэтому берётся та версия,
+# где от названия остаётся больше целых слов.
+TITLE_STYLES = {
+    "fox": (
+        "🦊🍁『 {title} 』✧『 24/7 』🍁🦊",
+        "🦊🍁『 {title} 』🍁🦊",
+    ),
+    "clover": (
+        "💚🍀『 {title} 』┃『 24/7 』🍀💚",
+        "💚🍀『 {title} 』🍀💚",
+    ),
+    "swan": (
+        "🦢🤍🦢 {title} ── ✧ 24/7 ✧ ── 🦢🤍🦢",
+        "🦢🤍🦢 {title} 🦢🤍🦢",
+    ),
+    "crystal": (
+        "🧊🤍🧊『 {title} 』❖『 24/7 』🧊🤍🧊",
+        "🧊🤍🧊『 {title} 』🧊🤍🧊",
+    ),
+    "mage": (
+        "🔮👾🔮【 {title} 】🔮【 24/7 】👾🔮",
+        "🔮👾🔮【 {title} 】👾🔮",
+    ),
+    "plane": (
+        "【🤍】🛫✨ ◈ {title} ◈ 24/7 🛫✨",
+        "【🤍】🛫✨ ◈ {title} ◈ 🛫✨",
+    ),
+    # Свои рамки для мод-меню и блокировок: владелец магазина выбрал их отдельно.
+    "mod": (
+        "🟢🔰🟢【{title}】ЧИТАЙТЕ ОПИСАНИЕ🟢🔰🟢",
+        "🟢🔰🟢【{title}】🟢🔰🟢",
+    ),
+    "hwid": (
+        "💠🟦💠| {title} |🟦| АВТОВЫДАЧА |💠🟦💠",
+        "💠🟦💠| {title} |💠🟦💠",
+    ),
+}
+
+# Разные категории товаров получают разное оформление: моды не должны
+# выглядеть как гайды по пингу. Стиль каждой категории задаётся отдельной
+# переменной в .env, поэтому менять код для смены дизайна не нужно.
+DEFAULT_CATEGORY_STYLES = {
+    "guide": "fox",
+    "pc": "swan",
+    "net": "crystal",
+    "mod": "mod",
+    "hwid": "hwid",
+}
+
+# Порядок важен: первое совпадение определяет категорию. Ключевые слова
+# подобраны так, чтобы обычные гайды («сборка билда», «настройка сервера»)
+# не попадали в моды или ПК по случайной подстроке.
+_CATEGORY_KEYWORDS = (
+    ("mod", ("мод меню", "мод-меню", "моды", "модов", "мод ", "модификац",
+             "сборка модов", "сборки модов", "overhaul", "wemod")),
+    ("hwid", ("hwid", "блокировк", "спуфер", "uuid", "mac-адрес", "снять бан")),
+    ("net", ("пинг", "ping", "сете", "сеть", "сети", "соединен", "соединён",
+             "dns", "задержк", " лаг", "lag")),
+    ("pc", (" пк", "pc ", "пк ", "fps", "фпс", "оптимизац", "видеокарт",
+            "процессор", "nvidia", "windows", "виндовс", "компьютер")),
+)
 
 
-def generate_short_description_ruble(title, platform="PC"):
-    """Единый заголовок для всех лотов: один эмодзи и название товара.
+def detect_title_category(title, product_type=""):
+    """Категория лота по названию и типу товара (mod, hwid, net, pc, guide)."""
+    low = f" {title} {product_type} ".lower()
+    for category, keywords in _CATEGORY_KEYWORDS:
+        if any(keyword in low for keyword in keywords):
+            return category
+    return "guide"
 
-    Никаких «+БОНУС», цветных кружков и повторяющихся смайликов: список
-    лотов в разделе читается как аккуратный перечень, а не как набор
-    случайно оформленных строк. Платформа остаётся в подписи для
-    совместимости со старыми вызовами.
+
+def category_style(category):
+    """Стиль для категории: TITLE_STYLE_<КАТЕГОРИЯ> в .env или значение по умолчанию."""
+    value = os.getenv(f"TITLE_STYLE_{str(category).upper()}", "").strip().lower()
+    if value in TITLE_STYLES:
+        return value
+    return DEFAULT_CATEGORY_STYLES.get(category, "fox")
+
+
+def _style_variants(style_name):
+    """Возвращает пару шаблонов выбранного стиля (неизвестный — стиль по умолчанию)."""
+    return TITLE_STYLES.get(style_name) or TITLE_STYLES["fox"]
+
+
+def _title_words_left(summary, title):
+    """Сколько целых слов названия осталось в готовом заголовке."""
+    upper = summary.upper()
+    return sum(1 for word in str(title).split() if word and word.upper() in upper)
+
+
+def _decorate_title(title, style_name):
+    """Оборачивает название в рамку выбранного стиля, сохраняя больше слов."""
+    best = None
+    best_words = -1
+    for template in _style_variants(style_name):
+        candidate = fit_summary(template.format(title=title), title=title)
+        words = _title_words_left(candidate, title)
+        if words > best_words:
+            best, best_words = candidate, words
+        if words == len(title.split()):
+            break  # название вошло целиком — более простой вариант не нужен
+    return best
+
+
+def generate_short_description_ruble(title, platform="PC", product_type="", category=None):
+    """Собирает красивый заголовок лота в стиле своей категории.
+
+    Шаблон оборачивает название парными эмодзи и рамками. Если название
+    длинное, плашка «24/7» отбрасывается: лучше сохранить слова товара,
+    чем декор. Оба варианта проходят лимиты FunPay.
     """
     t = str(title).upper()
-    return fit_summary(f"{random.choice(_TITLE_EMOJIS)} {t}", title=t)
+    if category is None:
+        category = detect_title_category(t, product_type)
+    return _decorate_title(t, category_style(category))
 
 
 def _emoji_points(points):
@@ -534,8 +643,9 @@ def generate_payment_message_en(link=""):
     )
 
 def generate_short_description_wemod(game_name):
-    c = random.sample(COLOR_BANK, 2)
-    return f"{c[0]}{c[1]}{c[0]}【МОД МЕНЮ НА {game_name.upper()}】ЧИТАЙТЕ ОПИСАНИЕ{c[0]}{c[1]}{c[0]}"
+    """Мод-меню оформляется своим стилем, чтобы не путаться с обычными гайдами."""
+    title = f"МОД МЕНЮ НА {str(game_name).upper()}"
+    return _decorate_title(title, category_style("mod"))
 
 
 def generate_full_description_wemod(game_name):

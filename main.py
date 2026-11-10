@@ -295,7 +295,9 @@ def process_single_game(session, game_data, net_session):
                 if os.path.exists(file_path):
                     os.remove(file_path)
 
-            short = generate_short_description_ruble(idea["title"])
+            short = generate_short_description_ruble(
+                idea["title"], product_type=idea.get("type", "")
+            )
             full = generate_full_description_ruble(idea, game_name)
             pay_msg = generate_payment_message(link)
 
@@ -610,7 +612,7 @@ def _preflight_ai():
 
 
 def main():
-    print("=== FUNPAY AUTO-BOT v19.17 (без Запрета, ИИ через Cloudflare Worker) ===\n")
+    print("=== FUNPAY AUTO-BOT v19.18 (без Запрета, ИИ через Cloudflare Worker) ===\n")
 
     net_session, net_ok = setup_network()
     if not net_ok:
