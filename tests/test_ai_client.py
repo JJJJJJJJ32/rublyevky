@@ -1152,3 +1152,122 @@ class TestCloudflareFallbacks:
         assert text == "ответ после таймаута"
         assert model == "@cf/openai/gpt-oss-20b"
         assert calls == ["gemini-3.6-flash", "@cf/openai/gpt-oss-20b"]
+
+
+class TestRecurringErrors:
+    """Ошибки, которые раньше повторялись на каждом запросе."""
+
+    def test_minimal_thinking_level_is_retried_without_effort(self, monkeypatch):
+        """gemini-3.8/3.7 не принимают MINIMAL — повторяем без уровня."""
+        monkeypatch.setenv("AI_REASONING_EFFORT", "minimal")
+        calls = []
+
+        class _Session:
+            def post(self, url, **kwargs):
+                payload = kwargs["json"]
+                calls.append(dict(payload))
+                if "reasoning_effort" in payload:
+                    return _FakeResponse(
+                        status_code=400,
+                        data={"error": {
+                            "message": "Thinking level MINIMAL is not supported for this model",
+                        }},
+                    )
+                return _FakeResponse(
+                    data={"choices": [{"message": {"content": "гайд без minimal"}}]}
+                )
+
+        client = ai_client.AIClient(
+            base_url="http://worker.test",
+            token="t",
+            session=_Session(),
+            timeout=5,
+            models=["gemini-3.7-flash"],
+        )
+
+        text, model = client.chat_chain([{"role": "user", "content": "тест"}])
+
+        assert text == "гайд без minimal"
+        assert model == "gemini-3.7-flash"
+        assert calls[0]["reasoning_effort"] == "minimal"
+        assert "reasoning_effort" not in calls[-1]
+        assert "gemini-3.7-flash" in client._effort_unsupported
+
+        # Следующий запрос уже не тратит попытку на заведомый 400.
+        client.chat([{"role": "user", "content": "тест"}])
+        assert "reasoning_effort" not in calls[-1]
+
+    def test_remote_disconnect_is_retried_on_fresh_connection(self, monkeypatch):
+        """RemoteDisconnected — протухший keep-alive: повторяем, а не падаем."""
+        monkeypatch.setattr(ai_client, "ensure_worker_ip", lambda timeout=3.0: None)
+        monkeypatch.setattr(ai_client.time, "sleep", lambda seconds: None)
+        calls = []
+
+        class _Session:
+            def post(self, url, **kwargs):
+                calls.append(kwargs["json"]["model"])
+                if len(calls) == 1:
+                    raise requests.exceptions.ConnectionError(
+                        "('Connection aborted.', RemoteDisconnected("
+                        "'Remote end closed connection without response'))"
+                    )
+                return _FakeResponse(
+                    data={"choices": [{"message": {"content": "ответ со второй попытки"}}]}
+                )
+
+        client = ai_client.AIClient(
+            base_url="http://worker.test",
+            token="t",
+            session=_Session(),
+            timeout=5,
+            models=["gemini-3.6-flash"],
+        )
+
+        text = client.chat([{"role": "user", "content": "тест"}])
+
+        assert text == "ответ со второй попытки"
+        assert calls == ["gemini-3.6-flash", "gemini-3.6-flash"]
+
+    def test_worker_requests_do_not_reuse_keepalive(self):
+        """Каждый запрос идёт по свежему соединению: иначе Cloudflare рвёт сокет."""
+        client = ai_client.AIClient(
+            base_url="http://worker.test",
+            token="t",
+            session=object(),
+            models=["gemini-3.6-flash"],
+        )
+
+        assert client._headers()["Connection"] == "close"
+
+    def test_mojibake_error_is_repaired(self):
+        """Worker может отдать UTF-8 поверх cp1251 — лог должен читаться."""
+        class _Response:
+            status_code = 400
+
+            def json(self):
+                return {"error": {"message": (
+                    "РїСЂРѕРІР°Р№РґРµСЂ РѕС‚РІРµС‚РёР» 400: Thinking level MINIMAL"
+                )}}
+
+            @property
+            def text(self):
+                return ""
+
+        message = ai_client._extract_error(_Response())
+
+        assert message.startswith("провайдер ответил 400")
+        assert "РїСЂ" not in message
+
+    def test_normal_russian_error_is_not_touched(self):
+        """Обычный текст не должен попасть под «починку» перекодировки."""
+        class _Response:
+            status_code = 400
+
+            def json(self):
+                return {"error": {"message": "неверный токен Worker'а"}}
+
+            @property
+            def text(self):
+                return ""
+
+        assert ai_client._extract_error(_Response()) == "неверный токен Worker'а"

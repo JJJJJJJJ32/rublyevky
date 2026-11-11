@@ -360,6 +360,13 @@ class AIClient:
         # Модели, которых Worker не знает (нет binding/ключа): больше не
         # спрашиваем их до конца работы бота.
         self._unsupported = set()
+        # Модели, которые не принимают reasoning_effort=minimal (например,
+        # gemini-3.8-flash отвечает 400 «Thinking level MINIMAL is not
+        # supported»). Им уровень больше не отправляем.
+        self._effort_unsupported = set()
+        self._efforts_lock = threading.Lock()
+        # Сессию передали снаружи (тесты, другой модуль) — её не подменяем.
+        self._session_injected = session is not None
         # Поток по умолчанию выключен: с отключёнными «рассуждениями» ответ
         # приходит за секунды, а SSE через Worker иногда обрывается на
         # середине. Включается через AI_STREAM=1, если провайдер рвёт
@@ -398,7 +405,29 @@ class AIClient:
         headers = {"Content-Type": "application/json"}
         if self.token:
             headers["Authorization"] = f"Bearer {self.token}"
+        # Cloudflare закрывает простаивающие соединения через несколько
+        # секунд. Переиспользованный сокет после публикации лота (а это
+        # минуты) уже мёртв, и requests падает с RemoteDisconnected ещё до
+        # отправки запроса. Поэтому каждый запрос идёт по свежему
+        # соединению: +0,2 с на рукопожатие вместо постоянных обрывов.
+        headers["Connection"] = "close"
         return headers
+
+    def _reset_session(self):
+        """Выбрасывает пул соединений после обрыва (протухший keep-alive).
+
+        Созданную извне сессию не трогаем: её жизненным циклом управляет
+        вызывающий код (так делают тесты).
+        """
+        if self._session is None or self._session_injected:
+            return
+        with self._session_lock:
+            old = self._session
+            self._session = None
+        try:
+            old.close()
+        except Exception:
+            pass
 
     # ─── Прямой Gemini API (обход блокировки Worker'а) ───────────────────
 
@@ -649,7 +678,7 @@ class AIClient:
                     payload["max_tokens"] = max_tokens
                 if temperature is not None:
                     payload["temperature"] = temperature
-                if self.reasoning_effort:
+                if self.reasoning_effort and model_name not in self._effort_unsupported:
                     payload["reasoning_effort"] = self.reasoning_effort
 
                 try:
@@ -684,6 +713,35 @@ class AIClient:
                             json=payload,
                             timeout=self.timeout,
                             stream=False,
+                        )
+                        elapsed = round(time.time() - started, 1)
+                        error_text = _extract_error(resp)
+
+                    if (
+                        resp.status_code == 400
+                        and payload.get("reasoning_effort")
+                        and "thinking level" in (error_text or "").lower()
+                    ):
+                        # Модель не принимает reasoning_effort=minimal
+                        # (gemini-3.8-flash и gemini-3.7-flash отвечают
+                        # «Thinking level MINIMAL is not supported»).
+                        # Убираем уровень и сразу повторяем тот же запрос:
+                        # иначе модель зря выпадает из цепочки, а лог
+                        # заполняется одинаковыми 400.
+                        with self._efforts_lock:
+                            self._effort_unsupported.add(model_name)
+                        dropped = payload.pop("reasoning_effort", "")
+                        logger.info(
+                            f"[AI] {model_name}: не поддерживает "
+                            f"reasoning_effort={dropped} — повторяю без него"
+                        )
+                        started = time.time()
+                        resp = self.session.post(
+                            self._url("/v1/chat/completions"),
+                            headers=self._headers(),
+                            json=payload,
+                            timeout=self.timeout,
+                            stream=self.use_stream,
                         )
                         elapsed = round(time.time() - started, 1)
                         error_text = _extract_error(resp)
@@ -762,10 +820,9 @@ class AIClient:
                 except AILimitReached:
                     raise
                 except (requests.exceptions.ConnectionError, requests.exceptions.Timeout) as e:
-                    # Адрес один для всех моделей: если он недоступен,
-                    # перебирать модели бессмысленно. Сначала пробуем другой
-                    # адрес Cloudflare (провайдер режет часть из них), потом —
-                    # прямой Gemini, если в .env есть ключ.
+                    # Соединение с Worker'ом оборвалось. Сначала открываем
+                    # новое и пробуем ещё раз, потом — прямой Gemini, если в
+                    # .env есть ключ. Игру из-за этого не бросаем.
                     reason = _short_network_error(e)
                     logger.info(f"[AI] Worker недоступен: {reason}")
                     if isinstance(e, requests.exceptions.ReadTimeout):
@@ -777,18 +834,25 @@ class AIClient:
                         )
                         self._start_cooldown(model_name, reason, transient=True)
                         break
-                    # Сброс на TLS-рукопожатии часто разовый: один повтор
-                    # на том же/новом адресе почти всегда проходит.
-                    if _depth < 1:
+                    # Сброс на TLS-рукопожатии часто разовый, а
+                    # RemoteDisconnected — это почти всегда протухший
+                    # keep-alive сокет. Выбрасываем пул соединений и
+                    # повторяем: второй заход идёт по свежему сокету.
+                    if _depth < 2:
+                        self._reset_session()
                         try:
                             address = ensure_worker_ip()
                         except Exception:
                             address = None
                         if address:
-                            logger.info(f"[AI] Повторяю запрос через {address}")
+                            logger.info(
+                                f"[AI] Соединение оборвалось — повторяю через {address}"
+                            )
                         else:
-                            logger.info("[AI] Повторяю запрос к Worker'у")
-                        time.sleep(1.5)
+                            logger.info(
+                                "[AI] Соединение оборвалось — повторяю на новом соединении"
+                            )
+                        time.sleep(1.0 + _depth)
                         return self.chat(
                             messages,
                             model=model_name,
@@ -798,16 +862,25 @@ class AIClient:
                             _depth=_depth + 1,
                         )
                     if not direct_available() or not model_name.startswith("gemini-"):
-                        raise AIUnavailable(reason)
+                        # Адрес Worker'а один для всех моделей, но цепочку
+                        # всё равно не бросаем: следующая модель может
+                        # открыть новое соединение и ответить.
+                        last_error = AIModelUnavailable(
+                            f"{model_name}: {reason}"
+                        )
+                        logger.info(f"[AI] {model_name} недоступна: {reason}")
+                        break
                     logger.info("[AI] Иду в Gemini API напрямую (GEMINI_API_KEY из .env)")
                     try:
                         return self.direct_chat(model_name, messages, max_tokens, temperature)
                     except AILimitReached:
                         raise
                     except AIError as direct_error:
-                        raise AIUnavailable(
+                        last_error = AIModelUnavailable(
                             f"{reason}; напрямую Gemini тоже не ответил: {direct_error}"
-                        ) from direct_error
+                        )
+                        logger.info(f"[AI] {last_error}")
+                        break
                 except requests.exceptions.RequestException as e:
                     last_error = AIModelUnavailable(_short_network_error(e))
                     logger.info(f"[AI] {last_error}")
@@ -991,21 +1064,47 @@ def _gemini_usage(data):
     }
 
 
+def _repair_mojibake(text):
+    """Чинит текст, который Worker отдал в UTF-8 поверх cp1251.
+
+    В логах это выглядит как «РїСЂРѕРІР°Р№РґРµСЂ» вместо «провайдер»:
+    Worker когда-то был задеплоен с файлом в cp1251, и его сообщения об
+    ошибках приходят двойной перекодировкой. Чиним на стороне бота, чтобы
+    не требовать передеплоя и чтобы ошибки читались по-русски.
+    """
+    text = str(text or "")
+    if not text:
+        return text
+    cyrillic = sum(1 for char in text if "\u0400" <= char <= "\u04ff")
+    if cyrillic < 6:
+        return text
+    # Признак двойной перекодировки: много «Р»/«С» перед строчными буквами.
+    if text.count("Р") + text.count("С") < 3:
+        return text
+    try:
+        fixed = text.encode("cp1251").decode("utf-8")
+    except (UnicodeEncodeError, UnicodeDecodeError):
+        return text
+    return fixed or text
+
+
 def _extract_error(resp):
     """Достаёт человекочитаемую ошибку из ответа Worker'а."""
     try:
         data = resp.json()
         err = data.get("error")
         if isinstance(err, dict):
-            return err.get("message") or json.dumps(err, ensure_ascii=False)
+            return _repair_mojibake(
+                err.get("message") or json.dumps(err, ensure_ascii=False)
+            )
         if isinstance(err, str):
-            return err
+            return _repair_mojibake(err)
         if data.get("message"):
-            return data["message"]
+            return _repair_mojibake(data["message"])
     except Exception:
         pass
     text = (resp.text or "").strip()
-    return text[:300] if text else ""
+    return _repair_mojibake(text[:300]) if text else ""
 
 
 def _log_usage(model, usage, elapsed, chars):

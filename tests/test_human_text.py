@@ -101,6 +101,25 @@ def test_reasonable_number_of_list_lines_is_allowed():
     assert _is_list_heavy(text) is False
 
 
+def test_bullet_guide_with_explanations_is_allowed():
+    """Половина строк пунктами — нормально, если между ними есть абзацы.
+
+    Раньше такой гайд отбраковывался и уходил в повторную генерацию:
+    бот тратил ещё 1,5–2 минуты на тот же товар.
+    """
+    lines = []
+    for index in range(12):
+        lines.append(f"- шаг {index + 1} по настройке Cyberpunk 2077 и NVIDIA")
+        lines.append(
+            f"Шаг {index + 1} объясняет, какие параметры игры, Windows и "
+            "драйвера NVIDIA менять, в каком порядке и как проверить "
+            "результат по FPS в Cyberpunk 2077."
+        )
+    text = "\n".join(lines)
+
+    assert _is_list_heavy(text) is False
+
+
 def test_lot_descriptions_keep_one_delivery_line_per_style(monkeypatch):
     idea = {"title": "Маршрут фарма", "content_points": ["Локация", "Порядок действий"]}
 

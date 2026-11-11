@@ -99,12 +99,24 @@ def _count_words(text):
 
 
 def _is_list_heavy(text, threshold=0.4):
-    """True, если больше 40% непустых строк выглядят как пункты списка."""
+    """True, если больше 40 % строк — пункты и при этом мало объяснений.
+
+    Порог оставлен прежним, но добавлен запас по «живым» словам: гайд может
+    быть наполовину из пунктов, и это нормально, если между ними есть абзацы
+    с объяснениями. Раньше такой гайд отбраковывался и уходил в повторную
+    генерацию ещё на 1,5–2 минуты.
+    """
     lines = [line.strip() for line in str(text or "").splitlines() if line.strip()]
     if not lines:
         return False
-    list_lines = sum(bool(_LIST_LINE_RE.match(line)) for line in lines)
-    return list_lines / len(lines) > threshold
+    list_lines = [line for line in lines if _LIST_LINE_RE.match(line)]
+    if len(list_lines) / len(lines) <= threshold:
+        return False
+    prose_lines = {
+        line for line in lines if not _LIST_LINE_RE.match(line)
+    }
+    prose_words = sum(len(line.split()) for line in prose_lines)
+    return prose_words < 200
 
 
 def _is_repetitive(text, threshold=0.45):
