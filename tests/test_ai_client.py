@@ -995,3 +995,160 @@ def test_request_timeout_is_capped():
         models=["gemini-3.6-flash"],
     )
     assert client.timeout == ai_client.MAX_REQUEST_TIMEOUT
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# 7. Бесплатные модели Cloudflare как последний рубеж
+# ═══════════════════════════════════════════════════════════════════════
+
+class TestCloudflareFallbacks:
+    """Когда Gemini кончился или перегружен, в дело вступают модели Cloudflare."""
+
+    def test_default_chain_ends_with_cloudflare(self, monkeypatch):
+        monkeypatch.delenv("AI_MODEL_PRIORITY", raising=False)
+        monkeypatch.delenv("AI_CLOUDFLARE_MODELS", raising=False)
+
+        chain = ai_client.get_model_chain()
+
+        assert chain[-len(ai_client.CLOUDFLARE_FALLBACKS):] == ai_client.CLOUDFLARE_FALLBACKS
+        assert "@cf/openai/gpt-oss-120b" in chain
+
+    def test_cloudflare_models_can_be_disabled(self, monkeypatch):
+        monkeypatch.setenv("AI_CLOUDFLARE_MODELS", "off")
+
+        assert ai_client.get_cloudflare_models() == []
+        assert not any(model.startswith("@cf/") for model in ai_client.get_model_chain())
+
+    def test_cloudflare_models_from_env(self, monkeypatch):
+        monkeypatch.setenv("AI_CLOUDFLARE_MODELS", "@cf/openai/gpt-oss-20b, @cf/qwen/qwen3-30b-a3b-fp8")
+
+        extra = ai_client.get_cloudflare_models()
+
+        assert extra == ["@cf/openai/gpt-oss-20b", "@cf/qwen/qwen3-30b-a3b-fp8"]
+        assert ai_client.get_model_chain()[-2:] == extra
+
+    def test_overloaded_model_switches_to_next(self):
+        """503 «high demand» одной модели — не повод останавливать игру."""
+        calls = []
+
+        class _Session:
+            def post(self, url, **kwargs):
+                model = kwargs["json"]["model"]
+                calls.append(model)
+                if model == "gemini-3.6-flash":
+                    return _FakeResponse(
+                        status_code=503,
+                        data={"error": {"code": 503, "message": "This model is currently experiencing high demand"}},
+                    )
+                return _FakeResponse(
+                    data={"choices": [{"message": {"content": "ответ резервной модели"}}]}
+                )
+
+        client = ai_client.AIClient(
+            base_url="http://worker.test",
+            token="t",
+            session=_Session(),
+            timeout=5,
+            models=["gemini-3.6-flash", "@cf/openai/gpt-oss-120b"],
+        )
+
+        text, model = client.chat_chain([{"role": "user", "content": "тест"}])
+
+        assert text == "ответ резервной модели"
+        assert model == "@cf/openai/gpt-oss-120b"
+        assert calls == ["gemini-3.6-flash", "@cf/openai/gpt-oss-120b"]
+
+    def test_overloaded_model_gets_short_cooldown(self):
+        class _Session:
+            def post(self, url, **kwargs):
+                return _FakeResponse(
+                    status_code=503,
+                    data={"error": {"message": "provider overloaded"}},
+                )
+
+        client = ai_client.AIClient(
+            base_url="http://worker.test",
+            token="t",
+            session=_Session(),
+            timeout=5,
+            models=["gemini-3.6-flash"],
+        )
+
+        with pytest.raises(ai_client.AIError):
+            client.chat_chain([{"role": "user", "content": "тест"}])
+
+        # Перегрузка временная: пауза короткая, а не сутки.
+        assert 0 < client._cooldown_left("gemini-3.6-flash") <= 60
+        assert client._cooldown_kind["gemini-3.6-flash"] == "transient"
+
+    def test_missing_binding_marks_model_unsupported(self):
+        """no_binding значит «Worker не подключён к Workers AI» — больше не зовём."""
+        calls = []
+
+        class _Session:
+            def post(self, url, **kwargs):
+                model = kwargs["json"]["model"]
+                calls.append(model)
+                if model == "@cf/openai/gpt-oss-120b":
+                    return _FakeResponse(
+                        status_code=500,
+                        data={"error": {
+                            "message": "на Worker'е не подключён Workers AI (binding AI)",
+                            "type": "no_binding",
+                        }},
+                    )
+                return _FakeResponse(
+                    data={"choices": [{"message": {"content": "ответ Gemini"}}]}
+                )
+
+        client = ai_client.AIClient(
+            base_url="http://worker.test",
+            token="t",
+            session=_Session(),
+            timeout=5,
+            models=["@cf/openai/gpt-oss-120b", "gemini-3.6-flash"],
+        )
+
+        text, model = client.chat_chain([{"role": "user", "content": "тест"}])
+
+        assert text == "ответ Gemini"
+        assert model == "gemini-3.6-flash"
+        assert "@cf/openai/gpt-oss-120b" in client._unsupported
+
+        # Во второй раз недоступную модель даже не спрашиваем.
+        text, model = client.chat_chain([{"role": "user", "content": "тест"}])
+
+        assert model == "gemini-3.6-flash"
+        assert calls == ["@cf/openai/gpt-oss-120b", "gemini-3.6-flash", "gemini-3.6-flash"]
+
+    def test_model_unavailable_is_subclass_of_unavailable(self):
+        assert issubclass(ai_client.AIModelUnavailable, ai_client.AIUnavailable)
+        assert issubclass(ai_client.AIModelUnavailable, ai_client.AIError)
+
+    def test_read_timeout_switches_to_next_model(self):
+        """Модель не ответила за таймаут — пробуем следующую, игру не бросаем."""
+        calls = []
+
+        class _Session:
+            def post(self, url, **kwargs):
+                model = kwargs["json"]["model"]
+                calls.append(model)
+                if model == "gemini-3.6-flash":
+                    raise requests.exceptions.ReadTimeout("timed out")
+                return _FakeResponse(
+                    data={"choices": [{"message": {"content": "ответ после таймаута"}}]}
+                )
+
+        client = ai_client.AIClient(
+            base_url="http://worker.test",
+            token="t",
+            session=_Session(),
+            timeout=5,
+            models=["gemini-3.6-flash", "@cf/openai/gpt-oss-20b"],
+        )
+
+        text, model = client.chat_chain([{"role": "user", "content": "тест"}])
+
+        assert text == "ответ после таймаута"
+        assert model == "@cf/openai/gpt-oss-20b"
+        assert calls == ["gemini-3.6-flash", "@cf/openai/gpt-oss-20b"]
