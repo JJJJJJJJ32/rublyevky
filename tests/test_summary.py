@@ -4,8 +4,12 @@ import modules.description_builder as description_builder
 from config import LIMITS
 from modules.description_builder import (
     fit_summary,
+    generate_full_description_en,
     generate_full_description_ruble,
+    generate_payment_message_en,
+    generate_short_description_en,
     generate_short_description_ruble,
+    generate_short_description_wemod,
 )
 
 
@@ -63,7 +67,7 @@ def _assert_summary_limits(text):
 
 
 def _template(title, index, platform="PC"):
-    """Один из шести шаблонов короткого описания (как в generate_short_description_ruble)."""
+    """Старый «тяжёлый» шаблон: проверяем, что fit_summary его не ломает."""
     upper = title.upper()
     colors = ["🔴", "🟡", "🟢", "🔵", "🟣"]
     emojis = ["🔥", "💎", "✨", "🌟", "⚡"]
@@ -78,16 +82,117 @@ def _template(title, index, platform="PC"):
     return templates[index]
 
 
-def test_long_title_fits_all_six_summary_styles(monkeypatch):
-    """Каждый исходный стиль должен укладываться без посимвольного мусора."""
-    for style_index in range(6):
-        monkeypatch.setattr(
-            description_builder.random,
-            "choice",
-            lambda sequence, index=style_index: sequence[index],
+def test_every_style_fits_funpay_limits(monkeypatch):
+    """Каждый стиль витрины укладывается в лимиты и не теряет рамку."""
+    for style in description_builder.TITLE_STYLES:
+        monkeypatch.setitem(
+            description_builder.DEFAULT_CATEGORY_STYLES, "guide", style
         )
-        summary = generate_short_description_ruble(LONG_TITLE)
-        _assert_summary_limits(summary)
+        for title in (LONG_TITLE, PC_TITLE, PING_TITLE, HWID_TITLE):
+            summary = generate_short_description_ruble(title, category="guide")
+
+            _assert_summary_limits(summary)
+            assert "БОНУС" not in summary
+            assert "2026" not in summary
+            assert len(summary) > 20, repr(summary)
+            assert (
+                description_builder._is_emoji_char(summary[0]) or summary[0] == "【"
+            ), repr(summary)
+
+
+def test_title_category_is_detected_by_theme():
+    """У модов, пинга, ПК и блокировок свои категории — и свои стили."""
+    assert description_builder.detect_title_category(PING_TITLE) == "net"
+    assert description_builder.detect_title_category(PC_TITLE) == "pc"
+    assert (
+        description_builder.detect_title_category(
+            "ГОТОВЫЕ СБОРКИ МОДОВ И OVERHAUL МОДИФИКАЦИИ"
+        )
+        == "mod"
+    )
+    assert description_builder.detect_title_category(HWID_TITLE) == "hwid"
+    assert (
+        description_builder.detect_title_category("СХЕМА ПОДЗЕМНОГО БУНКЕРА")
+        == "guide"
+    )
+
+
+def test_common_guides_do_not_look_like_mods_or_pc():
+    """«Сборка билда» и «настройка сервера» — обычные гайды, не моды и не ПК."""
+    assert (
+        description_builder.detect_title_category(
+            "СБОРКА БИЛДА И НАСТРОЙКА СЕРВЕРА"
+        )
+        == "guide"
+    )
+    assert (
+        description_builder.detect_title_category("ЛУЧШИЕ ФЛАГИ И ХИТРОСТИ")
+        == "guide"
+    )
+
+
+def test_categories_use_different_styles(monkeypatch):
+    """Разные категории не должны выглядеть одинаково."""
+    monkeypatch.setitem(description_builder.DEFAULT_CATEGORY_STYLES, "guide", "fox")
+    monkeypatch.setitem(description_builder.DEFAULT_CATEGORY_STYLES, "net", "plane")
+
+    guide = generate_short_description_ruble(
+        "СХЕМА ПОДЗЕМНОГО БУНКЕРА", category="guide"
+    )
+    network = generate_short_description_ruble(PING_TITLE, category="net")
+
+    assert guide.split("『")[0] != network.split("『")[0]
+
+
+def test_long_title_drops_daily_badge_to_keep_words(monkeypatch):
+    """Когда название длинное, плашка «24/7» уступает словам товара."""
+    monkeypatch.setitem(description_builder.DEFAULT_CATEGORY_STYLES, "guide", "fox")
+
+    summary = generate_short_description_ruble(
+        "ЖЕСТКИЙ БИЛД БЕРСЕРКА ЧЕРЕЗ ДРОБОВИК И СТАЛЬНЫЕ КАСТЕТЫ",
+        category="guide",
+    )
+
+    assert "ДРОБОВИК" in summary
+    assert "24/7" not in summary
+
+
+def test_short_title_keeps_daily_badge(monkeypatch):
+    """Короткому названию плашка «24/7» помещается — она остаётся."""
+    monkeypatch.setitem(description_builder.DEFAULT_CATEGORY_STYLES, "guide", "fox")
+
+    summary = generate_short_description_ruble(PING_TITLE, category="guide")
+
+    assert "24/7" in summary
+    assert "ПИНГ" in summary
+
+
+def test_mod_style_uses_owner_frame():
+    """Мод-меню оформляется своей рамкой, а не как обычный гайд."""
+    summary = generate_short_description_wemod("Borderlands 2")
+
+    _assert_summary_limits(summary)
+    assert summary.startswith("🟢🔰🟢")
+    assert "МОД МЕНЮ НА BORDERLANDS 2" in summary
+    assert "ЧИТАЙТЕ ОПИСАНИЕ" in summary
+
+
+def test_hwid_style_uses_owner_frame():
+    """У блокировок своя рамка с «АВТОВЫДАЧА»."""
+    summary = generate_short_description_ruble(HWID_TITLE, category="hwid")
+
+    _assert_summary_limits(summary)
+    assert summary.startswith("💠🟦💠")
+    assert "БЛОКИРОВКУ" in summary
+
+
+def test_clean_summary_keeps_title_words():
+    """Оформление не должно съедать само название товара."""
+    summary = generate_short_description_ruble(PC_TITLE)
+
+    assert "МАНУАЛ" in summary
+    assert "ОПТИМИЗАЦИИ" in summary
+    assert len(summary) > 20, repr(summary)
 
 
 def test_all_six_templates_keep_useful_words_and_decoration():
@@ -259,3 +364,52 @@ def test_summary_shortening_is_written_to_file_not_console(tmp_path, monkeypatch
     log_text = (tmp_path / "errors.log").read_text(encoding="utf-8")
     assert "summary shortened" in log_text
     assert "level=" in log_text
+
+
+def test_short_description_never_ends_with_preposition():
+    """«... ГАЙД ПО» — оборванная фраза: служебное слово снимается."""
+    title = "ПЕРВАЯ КРОВАВАЯ ЛУНА НА 7 ДЕНЬ: ГАЙД ПО ВЫЖИВАНИЮ БЕЗ ОГНЕСТРЕЛА"
+
+    for index in range(6):
+        summary = fit_summary(_template(title, index), title=title)
+        words = re.findall(r"[А-Яа-яЁёA-Za-z]+", summary)
+        assert words, repr(summary)
+        assert words[-1].lower() not in description_builder._FUNCTION_WORDS, repr(summary)
+        # Старый баг: строка заканчивалась ровно на «ГАЙД ПО».
+        assert not re.search(r"\bПО\s*[】\]\)]?\s*$", summary, re.IGNORECASE), repr(summary)
+
+
+def test_full_description_puts_emoji_before_every_point():
+    idea = {
+        "title": "ФАРМ РЕСУРСОВ",
+        "content_points": ["Первый маршрут", "Второй маршрут", "Третий маршрут"],
+    }
+    description = generate_full_description_ruble(idea, "Тестовая игра")
+
+    for point in idea["content_points"]:
+        line = next(line.strip() for line in description.splitlines() if point in line)
+        assert description_builder._is_emoji_char(line[0]), repr(line)
+
+    emoji_count = sum(
+        1 for char in description if description_builder._is_emoji_char(char)
+    )
+    assert emoji_count >= 5, "в подробном описании должно быть несколько смайликов"
+
+
+def test_english_fields_are_built_locally_within_limits():
+    summary = fit_summary(generate_short_description_en(), is_en=True)
+    assert 10 <= len(summary) <= LIMITS["summary_max"]
+    assert len(summary.encode("utf-8")) <= LIMITS["summary_max_bytes"]
+
+    description = generate_full_description_en()
+    assert len(description) >= LIMITS["description_min_en"]
+    assert all(ord(char) < 128 for char in description)
+
+    payment = generate_payment_message_en("https://example.test/file")
+    assert len(payment) >= LIMITS["payment_msg_min_en"]
+    assert all(ord(char) < 128 for char in payment)
+
+    # Без ссылки функция не должна падать: раньше это ломало publish_lot.
+    payment_without_link = generate_payment_message_en()
+    assert len(payment_without_link) >= LIMITS["payment_msg_min_en"]
+    assert all(ord(char) < 128 for char in payment_without_link)

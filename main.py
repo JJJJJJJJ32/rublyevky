@@ -23,9 +23,22 @@ from modules.funpay_auth import get_session
 from modules.network import setup_network, recheck_network, get_proxy_url
 from modules.lot_publisher import publish_lot, get_category_info, RESULT_SUCCESS
 from modules.duplicate_checker import is_game_processed, mark_as_processed
-from modules.category_finder import find_funpay_category
+from modules import lot_registry
+from modules import idea_cache
+from modules.category_finder import find_funpay_category, CategoryLookupError
 from modules.mandatory_products import select_mandatory_products
 from modules import ai_client
+
+
+# Windows: при перенаправлении вывода (файл, планировщик, IDE) консоль может
+# быть в cp1251, и print() с эмодзи падает с UnicodeEncodeError. Замена
+# непечатных символов не даёт этой ошибке попасть в обработку игры.
+for _stream in (sys.stdout, sys.stderr):
+    if hasattr(_stream, "reconfigure"):
+        try:
+            _stream.reconfigure(errors="replace")
+        except Exception:
+            pass
 
 
 def _reconnect(net_session):
@@ -136,26 +149,62 @@ def _print_lot_status(index, total, ok, reason=None):
         print(f"[{index}/{total}] ❌ НЕ ВЫСТАВЛЕНО: {reason or 'ошибка публикации'}")
 
 
+# Ключи товара для журнала выставленных лотов. У обязательных товаров есть
+# стабильный id: ИИ может переформулировать их название от запуска к запуску,
+# и без id такой лот выставился бы повторно.
+def _lot_keys(idea):
+    keys = [lot_registry.lot_key(idea.get("title"))]
+    product_id = idea.get("id")
+    if product_id:
+        keys.append(f"mandatory:{product_id}")
+    return [key for key in keys if key]
+
+
+def _already_published(game_id, idea):
+    return any(lot_registry.was_published(game_id, key) for key in _lot_keys(idea))
+
+
+def _remember_lot(game_id, idea):
+    for key in _lot_keys(idea):
+        lot_registry.mark_published(game_id, key)
+
+
 # Сколько ждать, прежде чем написать «гайд ещё считается». Молчать минутами
 # нельзя: со стороны это выглядит как зависание.
 GUIDE_HEARTBEAT_SECONDS = 45.0
 
 
-def _await_content(future):
+# Сколько гайдов считать заранее. Гайд собирается из двух параллельных
+# запросов, поэтому запас в 2 товара убирает ожидание перед публикацией,
+# но не создаёт очередь из десятков запросов.
+GUIDE_PREFETCH = 3
+
+
+def _await_content(future, title=""):
     """Ждёт результат гайда и раз в GUIDE_HEARTBEAT_SECONDS печатает «всё ещё считаем».
 
     Одна короткая строка без модели, таймингов и текста гайда — только чтобы
-    было видно, что бот жив. Если гайд готов быстро, строка не печатается вовсе.
+    было видно, что бот жив и над каким товаром он работает. Если гайд готов
+    быстро, строка не печатается вовсе.
     """
     started = time.perf_counter()
     last_said = started
+    label = f" по «{_short_title(title)}»" if title else ""
     while not future.done():
         time.sleep(1.0)
         now = time.perf_counter()
         if now - last_said >= GUIDE_HEARTBEAT_SECONDS:
-            print(f"   ⏳ Гайд ещё считается ({int(now - started)} с)...")
+            print(f"   ⏳ Гайд{label} ещё считается ({int(now - started)} с)...")
             last_said = now
     return future.result()
+
+
+def _short_title(title, limit=70):
+    """Название товара для консоли: одна строка и без обрыва посреди слова."""
+    text = " ".join(str(title or "").split())
+    if len(text) <= limit:
+        return text
+    return text[:limit].rsplit(" ", 1)[0] + "…"
 
 
 def process_single_game(session, game_data, net_session):
@@ -170,29 +219,51 @@ def process_single_game(session, game_data, net_session):
         "publish_count": 0,
     }
     content_pool = None
-    content_future = None
+    pending = {}
 
     try:
-        # Идеи запрашиваем сразу, одновременно с поиском раздела на FunPay.
-        # Это экономит время, но не создаёт очередь из десятков запросов.
-        with ThreadPoolExecutor(max_workers=1) as preparation_pool:
-            ideas_future = preparation_pool.submit(_generate_ideas_timed, game_name)
+        # Сначала находим игру на FunPay: без её id нельзя ни проверить,
+        # что она уже обработана, ни вспомнить сохранённые идеи.
+        try:
             found = find_funpay_category(session, game_name)
+        except CategoryLookupError as error:
+            # FunPay не ответил — это не «игры нет». Игру не трогаем,
+            # иначе сетевой сбой стирает data/games_list.txt.
+            print(f"   [!] Не удалось проверить игру на FunPay: {error}")
+            print("       Игра остаётся в списке — повторим позже.")
+            logger.log_error(
+                f"Поиск раздела {game_name}: {error} — игра остаётся в списке"
+            )
+            return session, net_session
 
-            if not found:
-                print(f"   [!] Игра '{game_name}' не найдена. Пропуск.")
-                remove_game_from_list(game_name)
-                return session, net_session
+        if not found:
+            print(f"   [!] Игра '{game_name}' не найдена. Пропуск.")
+            remove_game_from_list(game_name)
+            return session, net_session
 
-            game_id = found["id"]
-            if is_game_processed(game_id):
-                remove_game_from_list(game_name)
-                return session, net_session
+        game_id = found["id"]
+        if is_game_processed(game_id):
+            remove_game_from_list(game_name)
+            return session, net_session
 
-            ai_ideas, ideas_seconds = ideas_future.result()
+        # Идеи для игры сохраняются на диск. При повторе после сбоя бот берёт
+        # те же названия, поэтому уже выставленные лоты узнаются и не дублируются.
+        cached_ideas = idea_cache.load_ideas(game_id)
+        if cached_ideas is not None:
+            ai_ideas = cached_ideas
+            metrics["ideas"] = 0.0
+            logger.info(f"[{game_name}] идеи взяты из сохранённых (без нового запроса)")
+            section_name = get_category_info(session, game_id)
+        else:
+            # Идеи запрашиваем одновременно с получением раздела FunPay:
+            # это экономит время, но не создаёт очередь из десятков запросов.
+            with ThreadPoolExecutor(max_workers=1) as preparation_pool:
+                ideas_future = preparation_pool.submit(_generate_ideas_timed, game_name)
+                section_name = get_category_info(session, game_id)
+                ai_ideas, ideas_seconds = ideas_future.result()
             metrics["ideas"] = ideas_seconds
+            idea_cache.save_ideas(game_id, ai_ideas)
 
-        section_name = get_category_info(session, game_id)
         print(f"\n🌍 РАЗДЕЛ: {section_name} ({found['type']})")
         print(f"📊 ИГРА: {game_name.upper()}")
         # Дальше идут сетевые вызовы и запросы к ИИ: без этой строки консоль
@@ -210,29 +281,76 @@ def process_single_game(session, game_data, net_session):
 
         fail_count = 0
         guide_success = 0
-        # В фоне готовится только следующий гайд. Пока он считается, текущий
-        # файл загружается и лот публикуется. Так мы не создаём большой поток
-        # запросов и не упираемся в лимит Worker'а.
-        content_pool = ThreadPoolExecutor(max_workers=2)
+        ai_failures = 0  # сколько товаров подряд остались без гайда из-за ИИ
 
-        for i, idea in enumerate(final_ideas):
-            logger.debug(f"Товар {i + 1}/{len(final_ideas)}: {idea['title']}")
-
-            if content_future is None:
-                content_future = content_pool.submit(
-                    _generate_content_timed, idea, game_name
+        # Уже выставленные лоты не публикуем снова: после любого сбоя игра
+        # возвращается в работу с того же места, а не с первого товара.
+        todo = []
+        for index, idea in enumerate(final_ideas):
+            if _already_published(game_id, idea):
+                print(
+                    f"   ⏭ Товар {index + 1}/{len(final_ideas)}: "
+                    f"«{_short_title(idea['title'])}» уже выставлен — пропуск"
                 )
-            content, guide_seconds = _await_content(content_future)
-            content_future = None
+            else:
+                todo.append(index)
+
+        if not todo:
+            print("   ✅ Все лоты этой игры уже выставлены ранее.")
+            print("      Выставить заново: py main.py --reset-lots")
+            mark_as_processed(game_id)
+            remove_game_from_list(game_name)
+            return session, net_session
+
+        # Гайды считаются заранее: пока текущий лот загружается и публикуется,
+        # в работе уже следующие. Каждый гайд — два параллельных запроса
+        # (основная часть и продолжение), поэтому ожидание почти не копится.
+        content_pool = ThreadPoolExecutor(max_workers=GUIDE_PREFETCH)
+
+        def _submit_guide(index):
+            pending[index] = content_pool.submit(
+                _generate_content_timed, final_ideas[index], game_name
+            )
+
+        for index in todo[:GUIDE_PREFETCH]:
+            _submit_guide(index)
+
+        for position, i in enumerate(todo):
+            idea = final_ideas[i]
+            logger.debug(f"Товар {i + 1}/{len(final_ideas)}: {idea['title']}")
+            print(f"\n🎮 Товар {i + 1}/{len(final_ideas)}: {_short_title(idea['title'])}")
+
+            try:
+                content, guide_seconds = _await_content(
+                    pending.pop(i), idea["title"]
+                )
+            except ai_client.AIError as error:
+                # Один товар без гайда — не повод перезапускать всю игру:
+                # уже выставленные лоты остаются, а следующие ещё могут
+                # получиться на другой модели.
+                ai_failures += 1
+                metrics["guide_count"] += 1
+                print(f"   [!] ИИ не ответил по этому товару: {error}")
+                _print_lot_status(i + 1, len(final_ideas), False, "ИИ не ответил")
+                logger.log_error(
+                    f"Гайд не сгенерирован ({game_name}, товар {i + 1}): {error}"
+                )
+                next_position = position + GUIDE_PREFETCH
+                if next_position < len(todo):
+                    _submit_guide(todo[next_position])
+                if ai_failures >= 3:
+                    # ИИ лежит целиком — дальше долбить его бессмысленно.
+                    raise
+                continue
+
+            ai_failures = 0
             metrics["guides"] += guide_seconds
             metrics["guide_count"] += 1
 
-            # Следующий гайд начинает считаться до загрузки и публикации текущего.
-            if i + 1 < len(final_ideas):
-                next_idea = final_ideas[i + 1]
-                content_future = content_pool.submit(
-                    _generate_content_timed, next_idea, game_name
-                )
+            # Держим в работе следующие гайды, пока публикуется текущий.
+            next_position = position + GUIDE_PREFETCH
+            if next_position < len(todo):
+                _submit_guide(todo[next_position])
 
             if not content:
                 # Плохой гайд не публикуется.
@@ -254,7 +372,9 @@ def process_single_game(session, game_data, net_session):
                 if os.path.exists(file_path):
                     os.remove(file_path)
 
-            short = generate_short_description_ruble(idea["title"])
+            short = generate_short_description_ruble(
+                idea["title"], product_type=idea.get("type", "")
+            )
             full = generate_full_description_ruble(idea, game_name)
             pay_msg = generate_payment_message(link)
 
@@ -297,6 +417,7 @@ def process_single_game(session, game_data, net_session):
 
             if result == RESULT_SUCCESS:
                 fail_count = 0
+                _remember_lot(game_id, idea)
                 _print_lot_status(i + 1, len(final_ideas), True)
             else:
                 fail_count += 1
@@ -310,9 +431,8 @@ def process_single_game(session, game_data, net_session):
                     remove_game_from_list(game_name)
                     return session, net_session
 
-            # В v18.4 была пауза 3–6 секунд. Длинная пауза 7–15 секунд
-            # здесь не нужна: следующий гайд уже считается в фоне.
-            time.sleep(random.randint(3, 6))
+            # Пауза только чтобы не долбить FunPay: следующий гайд уже считается.
+            time.sleep(random.randint(1, 2))
 
         if guide_success == 0:
             # ИИ не выдал ни одного гайда (лимит, устаревший Worker, отказы).
@@ -322,34 +442,38 @@ def process_single_game(session, game_data, net_session):
             return session, net_session
 
         if check_wemod_availability(game_name):
-            print("💎 СОЗДАНИЕ WEMOD...")
-            publish_started = time.perf_counter()
-            wemod_result, session, net_session = _publish_with_heal(
-                session,
-                net_session,
-                game_id,
-                generate_short_description_wemod(game_name),
-                generate_full_description_wemod(game_name),
-                generate_payment_message(config.WEMOD_FIXED_LINK),
-                60,
-            )
-            metrics["publishing"] += time.perf_counter() - publish_started
-            metrics["publish_count"] += 1
-
-            if wemod_result == RESULT_SUCCESS:
-                print("   💎 WeMod: ✅ ВЫСТАВЛЕНО")
-            elif wemod_result == "limit_reached":
-                print("   💎 WeMod: ❌ НЕ ВЫСТАВЛЕНО: лимит лотов в категории")
-            elif wemod_result == "cloudflare_banned":
-                print(f"      🚫 Cloudflare: пауза {config.CLOUDFLARE_PAUSE // 60} мин...")
-                time.sleep(config.CLOUDFLARE_PAUSE)
-                session = get_session(network_session=net_session, fresh=True)
+            if lot_registry.was_published(game_id, "WeMod"):
+                print("   💎 WeMod: уже выставлен ранее — пропуск")
             else:
-                print(
-                    "   💎 WeMod: ❌ НЕ ВЫСТАВЛЕНО: "
-                    f"{_FAILURE_REASONS.get(wemod_result, 'ошибка публикации')}"
+                print("💎 СОЗДАНИЕ WEMOD...")
+                publish_started = time.perf_counter()
+                wemod_result, session, net_session = _publish_with_heal(
+                    session,
+                    net_session,
+                    game_id,
+                    generate_short_description_wemod(game_name),
+                    generate_full_description_wemod(game_name),
+                    generate_payment_message(config.WEMOD_FIXED_LINK),
+                    60,
                 )
-                logger.log_error(f"WeMod-лот не выставлен ({game_name}): {wemod_result}")
+                metrics["publishing"] += time.perf_counter() - publish_started
+                metrics["publish_count"] += 1
+
+                if wemod_result == RESULT_SUCCESS:
+                    lot_registry.mark_published(game_id, "WeMod")
+                    print("   💎 WeMod: ✅ ВЫСТАВЛЕНО")
+                elif wemod_result == "limit_reached":
+                    print("   💎 WeMod: ❌ НЕ ВЫСТАВЛЕНО: лимит лотов в категории")
+                elif wemod_result == "cloudflare_banned":
+                    print(f"      🚫 Cloudflare: пауза {config.CLOUDFLARE_PAUSE // 60} мин...")
+                    time.sleep(config.CLOUDFLARE_PAUSE)
+                    session = get_session(network_session=net_session, fresh=True)
+                else:
+                    print(
+                        "   💎 WeMod: ❌ НЕ ВЫСТАВЛЕНО: "
+                        f"{_FAILURE_REASONS.get(wemod_result, 'ошибка публикации')}"
+                    )
+                    logger.log_error(f"WeMod-лот не выставлен ({game_name}): {wemod_result}")
 
         mark_as_processed(game_id)
         remove_game_from_list(game_name)
@@ -358,14 +482,27 @@ def process_single_game(session, game_data, net_session):
     except ai_client.AILimitReached:
         # Главный цикл решает, как переждать общий лимит, не удаляя игру.
         raise
+    except ai_client.AIUnavailable as error:
+        # Worker/провайдер недоступен. Игру не трогаем, а главный цикл
+        # подождёт подольше, чтобы не долбить ИИ каждые 5 секунд.
+        print(f"   [!] ИИ недоступен: {error}")
+        print("       Игра остаётся в списке — повторим позже.")
+        logger.log_error(f"ИИ недоступен на игре {game_name}: {error} — игра остаётся в списке")
+        raise
+    except ai_client.AIError as error:
+        # Любой сбой ИИ (лимит, недоступный Worker, неизвестная модель) —
+        # не повод удалять игру: повторим её в следующем круге.
+        print(f"   [!] ИИ не ответил: {error}")
+        print("       Игра остаётся в списке — повторим позже.")
+        logger.log_error(f"ИИ не ответил на игре {game_name}: {error} — игра остаётся в списке")
     except Exception as error:
         print(f"   [!] Ошибка в игре: {error}")
-        logger.log_error(f"Ошибка обработки игры {game_name}: {error}")
-        remove_game_from_list(game_name)
+        print("       Игра остаётся в списке — повторим позже.")
+        logger.log_error(f"Ошибка обработки игры {game_name}: {error} — игра остаётся в списке")
     finally:
-        if content_future is not None:
-            content_future.cancel()
         if content_pool is not None:
+            for future in list(pending.values()):
+                future.cancel()
             content_pool.shutdown(wait=False, cancel_futures=True)
         _print_game_metrics(game_name, metrics)
 
@@ -398,16 +535,41 @@ def run_selftest():
     print(f"   • GOOGLE_DRIVE_FOLDER_ID: {'✅ есть' if os.getenv('GOOGLE_DRIVE_FOLDER_ID') else '❌ нет'}")
     print(f"   • AI_WORKER_URL: {'✅ есть' if ai_client.get_worker_url() else '⚠️ нет (настрой Cloudflare Worker)'}")
     print(f"   • AI_WORKER_TOKEN: {'✅ есть' if ai_client.get_worker_token() else '⚠️ нет'}")
+    print(
+        "   • GEMINI_API_KEY: "
+        + (
+            "✅ есть (прямой путь, если Worker заблокирован)"
+            if ai_client.direct_available()
+            else "— нет (только через Worker)"
+        )
+    )
     print(f"   • PROXY_URL: {'✅ задан' if get_proxy_url() else '— не задан (ходим напрямую)'}")
+    print(
+        "   • AI_PROXY_URL: "
+        + (
+            "✅ задан"
+            if os.getenv("AI_PROXY_URL")
+            else (
+                "— не задан (для Worker'а берём PROXY_URL)"
+                if get_proxy_url()
+                else "— не задан (к Worker'у ходим напрямую)"
+            )
+        )
+    )
 
     # 2. Worker ИИ
     print("\n[2/5] Cloudflare Worker (ИИ)")
     if not ai_client.client.configured:
         print("   ⚠️ Worker не настроен — пропускаем. Инструкция: README.md, раздел 4")
     else:
+        # Сначала находим рабочий адрес Cloudflare: провайдер режет часть
+        # anycast-адресов, и без этого self-test ждёт таймаут впустую.
+        ai_client.ensure_worker_ip()
         ok, info = ai_client.client.health()
         if ok:
             print(f"   ✅ Worker отвечает: {ai_client.get_worker_url()}")
+            if ai_client.worker_ip():
+                print(f"   • рабочий адрес Cloudflare: {ai_client.worker_ip()}")
             print(f"   • дата-центр Cloudflare: {info.get('colo', '?')}")
             print(f"   • версия Worker'а: {info.get('version', '?')}")
             providers = info.get("providers") or {}
@@ -417,7 +579,17 @@ def run_selftest():
                 print(f"   • подсказка: {info['hint']}")
         else:
             print(f"   ❌ {info}")
-            problems.append(f"Worker: {info}")
+            if ai_client.direct_available():
+                print("      В .env есть GEMINI_API_KEY — бот пойдёт в Gemini API напрямую, без Worker'а.")
+            elif ai_client.get_ai_proxy():
+                print("      Прокси для ИИ задан, но Worker всё равно не ответил — проверь сам прокси.")
+            else:
+                print("      Провайдер режет адреса Cloudflare: бот перебрал их, но ни один не ответил.")
+                print("      Такие волны обычно проходят за несколько минут — запустите снова позже.")
+                print("      Если не проходит: 1) прокси AI_PROXY_URL=http://логин:пароль@хост:порт")
+                print("                2) свой домен для Worker'а: AI_WORKER_URL=https://ai.ваш-домен")
+                print("                3) бесплатно: GEMINI_API_KEY=... в .env — прямой путь в Gemini")
+                problems.append(f"Worker: {info}")
 
         # Модель из AI_MODEL_PRIORITY должна быть известна Worker'у.
         missing, available = ai_client.check_model_support()
@@ -432,7 +604,7 @@ def run_selftest():
         elif available:
             print(
                 "   • модель "
-                + ", ".join(str(m) for m in ai_client.get_model_priority())
+                + ", ".join(str(m) for m in ai_client.get_model_chain())
                 + ": ✅ поддерживается Worker'ом"
             )
 
@@ -498,6 +670,11 @@ def _preflight_ai():
     Если Worker устарел и не знает модель, бот не начинает перебирать игры:
     он печатает понятную подсказку и ждёт, пока Worker обновят.
     """
+    if ai_client.client.configured:
+        # Провайдер режет часть anycast-адресов Cloudflare: находим рабочий
+        # до первого запроса, чтобы не ждать таймаут на каждом товаре.
+        ai_client.ensure_worker_ip()
+
     missing, available = ai_client.check_model_support()
     if available and missing:
         print("   [!] Worker не знает модель(и): " + ", ".join(str(m) for m in missing))
@@ -510,14 +687,14 @@ def _preflight_ai():
         return False
     if available:
         logger.info(
-            "Worker знает модели из цепочки: "
-            + ", ".join(str(m) for m in ai_client.get_model_priority())
+            "Цепочка моделей: "
+            + ", ".join(str(m) for m in ai_client.get_model_chain())
         )
     return True
 
 
 def main():
-    print("=== FUNPAY AUTO-BOT v19.7 (без Запрета, ИИ через Cloudflare Worker) ===\n")
+    print("=== FUNPAY AUTO-BOT v20.0 (без Запрета, ИИ через Cloudflare Worker) ===\n")
 
     net_session, net_ok = setup_network()
     if not net_ok:
@@ -552,9 +729,14 @@ def main():
             print("\n⏹ Остановлено пользователем.")
             break
         except ai_client.AILimitReached as e:
-            print(f"   [AI] ⚠️ Лимит ИИ исчерпан: {e}")
+            print(f"   [AI] ⚠️ Лимит ИИ исчерпан на всех моделях: {e}")
+            print("   [AI]    У бесплатного Gemini дневной лимит (у flash — 20 запросов).")
             print("   [AI]    Ждём 30 минут и продолжаем с этого же места.")
             time.sleep(1800)
+        except ai_client.AIUnavailable as e:
+            print(f"   [AI] ⚠️ Worker или провайдер недоступен: {e}")
+            print("   [AI]    Ждём 60 секунд и пробуем снова (игра не потеряна).")
+            time.sleep(60)
         except Exception as e:
             print(f"💥 Ошибка цикла: {e}")
             logger.log_error(f"Ошибка главного цикла: {e}")
@@ -564,4 +746,13 @@ def main():
 if __name__ == "__main__":
     if "--selftest" in sys.argv or "--check" in sys.argv:
         sys.exit(0 if run_selftest() else 1)
+    if "--reset-lots" in sys.argv:
+        # История выставленных лотов: после сброса бот снова опубликует все
+        # товары, даже если они уже есть на FunPay. Дубли удалять вручную.
+        lot_registry.clear()
+        idea_cache.clear()
+        print("🧹 История выставленных лотов очищена (data/published_lots.json).")
+        print("   Сохранённые идеи товаров тоже забыты (data/game_ideas.json).")
+        print("   Следующий запуск выставит все товары заново: py main.py")
+        sys.exit(0)
     main()

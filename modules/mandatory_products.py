@@ -119,6 +119,9 @@ def _public_product(product):
     if not isinstance(points, (list, tuple)):
         points = []
     return {
+        # id обязательного товара: по нему бот узнаёт уже выставленный лот,
+        # даже если ИИ переформулировал название при следующем запуске.
+        "id": str(product.get("id", "")),
         "title": str(product.get("title", "Игровая инструкция")),
         "type": str(product.get("type", "инструкция")),
         "content_points": [str(point) for point in points][:6],
@@ -307,6 +310,9 @@ def select_mandatory_products(game_name, section_name=""):
         if should_replace:
             replacement = replacements.get(product_id) or _default_replacement(product_id, game_name, signals)
             replacement = _public_product(replacement)
+            # Замена остаётся тем же обязательным товаром: id сохраняем,
+            # чтобы журнал выставленных лотов узнавал его при повторном запуске.
+            replacement["id"] = product_id
             reason = reasons.get(product_id)
             if not reason:
                 reason = "быстрый фильтр по названию/разделу игры"

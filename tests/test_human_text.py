@@ -9,6 +9,9 @@ from modules.ai_generator import (
     _postprocess_guide,
     ai_generate_full_content,
 )
+import pytest
+
+from modules import ai_client
 
 
 FORBIDDEN_PHRASES = (
@@ -94,6 +97,25 @@ def test_reasonable_number_of_list_lines_is_allowed():
         "Третий абзац с конкретными деталями.",
         "Четвёртый абзац с проверкой результата.",
     ])
+
+    assert _is_list_heavy(text) is False
+
+
+def test_bullet_guide_with_explanations_is_allowed():
+    """Половина строк пунктами — нормально, если между ними есть абзацы.
+
+    Раньше такой гайд отбраковывался и уходил в повторную генерацию:
+    бот тратил ещё 1,5–2 минуты на тот же товар.
+    """
+    lines = []
+    for index in range(12):
+        lines.append(f"- шаг {index + 1} по настройке Cyberpunk 2077 и NVIDIA")
+        lines.append(
+            f"Шаг {index + 1} объясняет, какие параметры игры, Windows и "
+            "драйвера NVIDIA менять, в каком порядке и как проверить "
+            "результат по FPS в Cyberpunk 2077."
+        )
+    text = "\n".join(lines)
 
     assert _is_list_heavy(text) is False
 
@@ -272,3 +294,90 @@ def test_all_bad_guides_are_not_published(monkeypatch):
     monkeypatch.setattr("modules.ai_generator.time.sleep", lambda seconds: None)
 
     assert ai_generate_full_content(IDEA, GAME) is None
+
+
+def test_short_guide_is_extended_in_second_request(monkeypatch):
+    """Гайд собирается двумя запросами: основная часть и продолжение."""
+    part2 = (
+        "Дальше по Cyberpunk 2077 проверь ещё один параметр в настройках графики: "
+        "отключи трассировку лучей на слабой видеокарте и сравни FPS на том же "
+        "маршруте. Если просадки остались, снизь качество теней и обнови драйвер."
+    )
+    calls = []
+
+    def fake_ask(messages, **kwargs):
+        prompt = messages[0]["content"]
+        calls.append(prompt)
+        if "вторая часть" in prompt:
+            return part2
+        return _good_guide()
+
+    monkeypatch.setattr("modules.ai_generator._ask", fake_ask)
+    monkeypatch.setattr("modules.ai_generator.time.sleep", lambda seconds: None)
+
+    result = ai_generate_full_content(IDEA, GAME)
+
+    assert len(calls) == 2, "обе части должны запрашиваться за один проход"
+    assert result is not None
+    assert "Дальше по Cyberpunk 2077" in result
+    assert "Открой настройки Cyberpunk 2077" in result
+
+
+def test_continuation_failure_keeps_first_part(monkeypatch):
+    """Если вторая часть оборвалась, уже полученная первая не выбрасывается."""
+    calls = []
+
+    def fake_ask(messages, **kwargs):
+        prompt = messages[0]["content"]
+        calls.append(prompt)
+        if "вторая часть" in prompt:
+            raise ai_client.AIUnavailable("обрыв связи")
+        return _good_guide()
+
+    monkeypatch.setattr("modules.ai_generator._ask", fake_ask)
+
+    result = ai_generate_full_content(IDEA, GAME)
+
+    assert len(calls) >= 2
+    assert result is not None
+    assert "Открой настройки Cyberpunk 2077" in result
+
+
+def test_unavailable_worker_stops_guide_attempts(monkeypatch):
+    """Если Worker недоступен, не тратим четыре попытки на разные промпты."""
+    calls = []
+
+    def fake_ask(messages, **kwargs):
+        calls.append(messages[0]["content"])
+        raise ai_client.AIUnavailable("Worker не отвечает")
+
+    monkeypatch.setattr("modules.ai_generator._ask", fake_ask)
+
+    with pytest.raises(ai_client.AIUnavailable):
+        ai_generate_full_content(IDEA, GAME)
+
+    # Обе параллельные части упали одинаково — дальше пробовать нечего.
+    assert len(calls) == 2
+
+
+def test_ask_propagates_unavailable(monkeypatch):
+    import modules.ai_generator as ai_generator
+
+    def boom(*args, **kwargs):
+        raise ai_client.AIUnavailable("нет Worker")
+
+    monkeypatch.setattr(ai_generator.ai_client, "ai_ask", boom)
+
+    with pytest.raises(ai_client.AIUnavailable):
+        ai_generator._ask([{"role": "user", "content": "тест"}])
+
+
+def test_ask_swallows_ordinary_ai_error(monkeypatch):
+    import modules.ai_generator as ai_generator
+
+    def boom(*args, **kwargs):
+        raise ai_client.AIError("пустой ответ")
+
+    monkeypatch.setattr(ai_generator.ai_client, "ai_ask", boom)
+
+    assert ai_generator._ask([{"role": "user", "content": "тест"}]) is None

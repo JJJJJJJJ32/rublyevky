@@ -50,7 +50,9 @@ def test_one_inappropriate_product_is_replaced(monkeypatch, tmp_path):
     result = mandatory_products.select_mandatory_products("PC online game", "PC")
 
     assert len(result) == 3
-    assert result[1] == replacement
+    # id сохраняется, чтобы журнал лотов узнавал замену при повторе игры.
+    assert result[1]["id"] == "ping"
+    assert {key: value for key, value in result[1].items() if key != "id"} == replacement
     assert result[0]["title"] == _all_titles()[0]
     assert result[2]["title"] == _all_titles()[2]
     log_text = (tmp_path / "mandatory_products.jsonl").read_text(encoding="utf-8")

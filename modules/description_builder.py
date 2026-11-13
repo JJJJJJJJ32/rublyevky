@@ -1,3 +1,4 @@
+import os
 import random
 import re
 import string
@@ -48,6 +49,22 @@ _DANGLING_DECOR = "◈◆◇□■●○★☆✦✧▪▫"
 _EMPTY_BRACKETS_RE = re.compile(
     r"(?:【\s*】|\(\s*\)|\[\s*\]|\{\s*\}|«\s*»)"
 )
+
+# Короткое описание нельзя обрывать на служебном слове: «... ГАЙД ПО» и
+# «... ТАКТИКА ДЛЯ» выглядят как незаконченная фраза. Такие хвосты снимаются
+# после сокращения по целым словам.
+_FUNCTION_WORDS = {
+    "а", "без", "бы", "в", "во", "вот", "где", "да", "для", "до", "его",
+    "ей", "если", "есть", "ещё", "же", "за", "здесь", "и", "из", "или",
+    "им", "их", "к", "как", "ко", "когда", "кто", "ли", "мне", "мы", "на",
+    "над", "надо", "не", "него", "нее", "нет", "ни", "но", "ну", "о", "об",
+    "от", "по", "под", "при", "про", "с", "со", "так", "также", "там", "то",
+    "того", "тоже", "только", "у", "уже", "хотя", "чего", "чей", "через",
+    "что", "чтобы", "эта", "эти", "это", "этот", "я",
+    "a", "an", "and", "as", "at", "by", "for", "from", "in", "into", "of",
+    "on", "or", "the", "to", "with", "within", "without", "your", "you",
+    "this", "that",
+}
 
 
 def _clean_summary_text(text, is_en=False):
@@ -116,6 +133,37 @@ def _trim_dangling_edges(text):
     while text and not _ends_with_complete_unit(text):
         text = text[:-1].rstrip()
     return text.strip()
+
+
+def _strip_trailing_function_words(text):
+    """Убирает служебные слова в конце: «ГАЙД ПО» → «ГАЙД».
+
+    Короткое описание должно заканчиваться смысловым словом, а не предлогом,
+    союзом или артиклем. Декоративные эмодзи и скобки после слова сохраняются.
+    """
+    text = str(text or "").strip()
+    while True:
+        tokens = text.split()
+        index = None
+        for position in range(len(tokens) - 1, -1, -1):
+            if re.search(r"[A-Za-zА-Яа-яЁё]", tokens[position]):
+                index = position
+                break
+        if index is None:
+            return text
+        word = re.search(r"[A-Za-zА-Яа-яЁё]+", tokens[index])
+        if not word or word.group(0).lower() not in _FUNCTION_WORDS:
+            return text
+        before = " ".join(tokens[:index]).rstrip(" :;,-—–")
+        if not before:
+            return text
+        # Скобки и эмодзи, стоящие после служебного слова, — часть рамки:
+        # «... ФАРМА В】🟢🔰🟢» должно стать «... ФАРМА】🟢🔰🟢», а не
+        # оборваться на незакрытой «【».
+        suffix = tokens[index][word.end():]
+        after = " ".join(tokens[index + 1:])
+        text = (before + suffix + (" " + after if after else "")).strip()
+    return text
 
 
 def _drop_unmatched_brackets(text):
@@ -221,6 +269,11 @@ def _fit_summary(text, title=None, is_en=False, min_chars=10, max_chars=70, max_
 
     def _add(level, value):
         ready = _finalize_summary(value, is_en=is_en)
+        # Хвост из предлога/союза («... ГАЙД ПО») обрезаем до смыслового слова.
+        ready = _strip_trailing_function_words(ready)
+        # Обрезка служебного слова может открыть незакрытую рамку — балансируем.
+        ready = _drop_unmatched_brackets(ready)
+        ready = _trim_dangling_edges(ready)
         if ready:
             candidates.append((level, ready))
 
@@ -306,94 +359,209 @@ def fit_summary(text, title=None, is_en=False):
     return result
 
 
-def generate_short_description_ruble(title, platform="PC"):
-    """Генерирует уникальный заголовок в одном из 6 стилей."""
-    e = random.sample(EMOJI_BANK, 5)
-    c = random.sample(COLOR_BANK, 5)
-    t = str(title).upper()
-    p = str(platform).upper()
+# Оформление витрины. Владелец магазина выбрал образцы в духе
+# «🦊🍁『 НАЗВАНИЕ 』✧『 24/7 』🍁🦊»: парные эмодзи по краям и рамки.
+# У каждого стиля две версии — с плашкой «24/7» и без неё. Длинное название
+# вместе с плашкой не помещается в лимит FunPay, поэтому берётся та версия,
+# где от названия остаётся больше целых слов.
+TITLE_STYLES = {
+    "fox": (
+        "🦊🍁『 {title} 』✧『 24/7 』🍁🦊",
+        "🦊🍁『 {title} 』🍁🦊",
+    ),
+    "clover": (
+        "💚🍀『 {title} 』┃『 24/7 』🍀💚",
+        "💚🍀『 {title} 』🍀💚",
+    ),
+    "swan": (
+        "🦢🤍🦢 {title} ── ✧ 24/7 ✧ ── 🦢🤍🦢",
+        "🦢🤍🦢 {title} 🦢🤍🦢",
+    ),
+    "crystal": (
+        "🧊🤍🧊『 {title} 』❖『 24/7 』🧊🤍🧊",
+        "🧊🤍🧊『 {title} 』🧊🤍🧊",
+    ),
+    "mage": (
+        "🔮👾🔮【 {title} 】🔮【 24/7 】👾🔮",
+        "🔮👾🔮【 {title} 】👾🔮",
+    ),
+    "plane": (
+        "【🤍】🛫✨ ◈ {title} ◈ 24/7 🛫✨",
+        "【🤍】🛫✨ ◈ {title} ◈ 🛫✨",
+    ),
+    # Свои рамки для мод-меню и блокировок: владелец магазина выбрал их отдельно.
+    "mod": (
+        "🟢🔰🟢【{title}】ЧИТАЙТЕ ОПИСАНИЕ🟢🔰🟢",
+        "🟢🔰🟢【{title}】🟢🔰🟢",
+    ),
+    "hwid": (
+        "💠🟦💠| {title} |🟦| АВТОВЫДАЧА |💠🟦💠",
+        "💠🟦💠| {title} |💠🟦💠",
+    ),
+}
 
-    variants = [
-        f"⚠️{c[0]}⚠️【 {t} 】{c[0]}【 АВТОВЫДАЧА 】{c[0]} ⚠️{c[0]}",
-        f"💗🌸{t}💗🌸АВТОВЫДАЧА💗🌸+БОНУС ЗА ОТЗЫВ💗🌸",
-        f"【🤍】🛫✨ ◈ {t} 🎮 ◈ 🛫✨【АВТОВЫДАЧА】",
-        f"⚜️💵⚜️ {t} ⚜️💵⚜️ {p} ⚜️💵⚜️ АВТО-ВЫДАЧА 24/7 ⚜️💵⚜️",
-        f"🟥⬛🟥 {t} 🟥⬛🟥 2026 АКТУАЛЬНО 🟥⬛🟥 УСТОЙЧИВЫ К БЛОКАМ 🟥⬛🟥",
-        f"{e[0]}{c[1]}【{p}】{e[1]}【{t}】{e[2]}【АВТОВЫДАЧА 24/7】{c[2]}",
-    ]
-    raw = random.choice(variants)
-    return fit_summary(raw, title=t)
+# Разные категории товаров получают разное оформление: моды не должны
+# выглядеть как гайды по пингу. Стиль каждой категории задаётся отдельной
+# переменной в .env, поэтому менять код для смены дизайна не нужно.
+DEFAULT_CATEGORY_STYLES = {
+    "guide": "fox",
+    "pc": "swan",
+    "net": "crystal",
+    "mod": "mod",
+    "hwid": "hwid",
+}
+
+# Порядок важен: первое совпадение определяет категорию. Ключевые слова
+# подобраны так, чтобы обычные гайды («сборка билда», «настройка сервера»)
+# не попадали в моды или ПК по случайной подстроке.
+_CATEGORY_KEYWORDS = (
+    ("mod", ("мод меню", "мод-меню", "моды", "модов", "мод ", "модификац",
+             "сборка модов", "сборки модов", "overhaul", "wemod")),
+    ("hwid", ("hwid", "блокировк", "спуфер", "uuid", "mac-адрес", "снять бан")),
+    ("net", ("пинг", "ping", "сете", "сеть", "сети", "соединен", "соединён",
+             "dns", "задержк", " лаг", "lag")),
+    ("pc", (" пк", "pc ", "пк ", "fps", "фпс", "оптимизац", "видеокарт",
+            "процессор", "nvidia", "windows", "виндовс", "компьютер")),
+)
+
+
+def detect_title_category(title, product_type=""):
+    """Категория лота по названию и типу товара (mod, hwid, net, pc, guide)."""
+    low = f" {title} {product_type} ".lower()
+    for category, keywords in _CATEGORY_KEYWORDS:
+        if any(keyword in low for keyword in keywords):
+            return category
+    return "guide"
+
+
+def category_style(category):
+    """Стиль для категории: TITLE_STYLE_<КАТЕГОРИЯ> в .env или значение по умолчанию."""
+    value = os.getenv(f"TITLE_STYLE_{str(category).upper()}", "").strip().lower()
+    if value in TITLE_STYLES:
+        return value
+    return DEFAULT_CATEGORY_STYLES.get(category, "fox")
+
+
+def _style_variants(style_name):
+    """Возвращает пару шаблонов выбранного стиля (неизвестный — стиль по умолчанию)."""
+    return TITLE_STYLES.get(style_name) or TITLE_STYLES["fox"]
+
+
+def _title_words_left(summary, title):
+    """Сколько целых слов названия осталось в готовом заголовке."""
+    upper = summary.upper()
+    return sum(1 for word in str(title).split() if word and word.upper() in upper)
+
+
+def _decorate_title(title, style_name):
+    """Оборачивает название в рамку выбранного стиля, сохраняя больше слов."""
+    best = None
+    best_words = -1
+    for template in _style_variants(style_name):
+        candidate = fit_summary(template.format(title=title), title=title)
+        words = _title_words_left(candidate, title)
+        if words > best_words:
+            best, best_words = candidate, words
+        if words == len(title.split()):
+            break  # название вошло целиком — более простой вариант не нужен
+    return best
+
+
+def generate_short_description_ruble(title, platform="PC", product_type="", category=None):
+    """Собирает красивый заголовок лота в стиле своей категории.
+
+    Шаблон оборачивает название парными эмодзи и рамками. Если название
+    длинное, плашка «24/7» отбрасывается: лучше сохранить слова товара,
+    чем декор. Оба варианта проходят лимиты FunPay.
+    """
+    t = str(title).upper()
+    if category is None:
+        category = detect_title_category(t, product_type)
+    return _decorate_title(t, category_style(category))
+
+
+def _emoji_points(points):
+    """Каждый пункт описания начинается со своего эмодзи."""
+    points = [str(point).strip() for point in (points or []) if str(point).strip()]
+    if not points:
+        return ""
+    emojis = random.sample(EMOJI_BANK, min(len(EMOJI_BANK), max(len(points) + 3, 5)))
+    return "\n".join(f"{emojis[index % len(emojis)]} {point}" for index, point in enumerate(points))
 
 
 def generate_full_description_ruble(idea, game_name):
-    """Выбирает один из 6 более живых стилей подробного описания."""
+    """Выбирает один из 6 живых стилей подробного описания.
+
+    Смайлики стоят в заголовке выдачи и перед каждым пунктом: так карточка
+    выглядит живой и её легче читать, но рядов из одинаковых эмодзи нет.
+    """
     title = idea["title"].upper()
     game = game_name.upper()
-    points = "\n".join(f"• {point}" for point in idea.get("content_points", []))
-    sampled_emojis = random.sample(EMOJI_BANK, 3)
+    points = _emoji_points(idea.get("content_points", []))
+    sampled_emojis = random.sample(EMOJI_BANK, 4)
 
     # В каждом стиле ровно одна строка про способ выдачи. Остальные формулировки
     # отличаются, чтобы карточки не выглядели копиями друг друга.
     v1 = f"""
 🕒АВТОВЫДАЧА 24/7🕒
-Ссылка появляется сразу после оплаты — ждать ответа продавца не нужно.
+✅ Ссылка появляется сразу после оплаты — ждать ответа продавца не нужно.
 
-Внутри лежит подробный материал по игре {game} и теме «{title}»:
+📘 Внутри лежит подробный материал по игре {game} и теме «{title}»:
 {points}
 
-Если открываешь файл впервые, начни с первого раздела и повторяй действия по порядку.
-Там, где результат зависит от уровня персонажа, режима или экипировки, это отдельно
-отмечено. Если что-то в игре выглядит иначе после обновления, напиши продавцу — разберёмся.
+🎯 Если открываешь файл впервые, начни с первого раздела и повторяй действия по порядку.
+💡 Там, где результат зависит от уровня персонажа, режима или экипировки, это отдельно отмечено.
+📩 Если что-то в игре выглядит иначе после обновления, напиши продавцу — разберёмся.
 """
 
     v2 = f"""
 🕒АВТОВЫДАЧА 24/7🕒
-Для {game}, когда нужен не общий совет из поиска, а понятный план под конкретную задачу.
-Материал «{title}» собран короткими блоками: сначала подготовка, затем сам маршрут или
+🎮 Для {game}, когда нужен не общий совет из поиска, а понятный план под конкретную задачу.
+📚 Материал «{title}» собран короткими блоками: сначала подготовка, затем сам маршрут или
 настройка, а после — несколько вариантов на случай, если основной способ не подошёл.
 
-Что встретится внутри:
+🔥 Что встретится внутри:
 {points}
 
-Сохрани файл после покупки: к нему удобно возвращаться перед новым заходом в игру.
+💾 Сохрани файл после покупки: к нему удобно возвращаться перед новым заходом в игру.
 """
 
     v3 = f"""
 🕒АВТОВЫДАЧА 24/7🕒
-Допустим, ты застрял на одном месте или тратишь слишком много времени на повторяющиеся
+🤔 Допустим, ты застрял на одном месте или тратишь слишком много времени на повторяющиеся
 действия. В этом материале по {game} разобрана именно такая ситуация — без длинной рекламы
 и лишней теории.
 
-Тема: {title}
+🎯 Тема: {title}
 {points}
 
-Сначала проверь условия из первого абзаца. Это важно: один и тот же приём может работать
+⚙️ Сначала проверь условия из первого абзаца. Это важно: один и тот же приём может работать
 по-разному в одиночном режиме и в группе. В конце есть несколько запасных вариантов,
 которые помогают, если нужный предмет или точка ещё недоступны.
 """
 
     v4 = f"""
 🕒АВТОВЫДАЧА 24/7🕒
-Объявление активно — файл можно получить в любое время, в том числе ночью.
+🌙 Объявление активно — файл можно получить в любое время, в том числе ночью.
 
-Для игры {game} подготовлен материал «{title}». Он рассчитан на обычный игровой процесс:
+📦 Для игры {game} подготовлен материал «{title}». Он рассчитан на обычный игровой процесс:
 без обещаний невозможного и без предложений покупать ещё пять похожих инструкций.
 {points}
 
-Перед применением сверяй название режима и текущую версию игры. Небольшая деталь вроде
+🔍 Перед применением сверяй название режима и текущую версию игры. Небольшая деталь вроде
 неподходящего уровня сложности часто меняет маршрут, поэтому такие условия указаны рядом
 с советом, а не спрятаны в конце.
 """
 
     v5 = f"""
 🕒АВТОВЫДАЧА 24/7🕒
-Здесь собрана практическая заметка для {game}: что подготовить, куда направиться и на каком
+🚀 Здесь собрана практическая заметка для {game}: что подготовить, куда направиться и на каком
 шаге обычно теряется время. Тема — «{title}».
 
-Основные ориентиры:
+📍 Основные ориентиры:
 {points}
 
-Не обязательно проходить всё за один вечер. Сначала попробуй базовый вариант, а затем
+⏱️ Не обязательно проходить всё за один вечер. Сначала попробуй базовый вариант, а затем
 перейди к дополнительным настройкам, если игра ведёт себя иначе. Так проще понять, какой
 совет дал результат именно в твоём случае.
 """
@@ -402,20 +570,82 @@ def generate_full_description_ruble(idea, game_name):
 🕒АВТОВЫДАЧА 24/7🕒
 {sampled_emojis[0]} Материал по {game} уже ждёт после оплаты.
 
-Тема «{title}» объяснена человеческим языком: без повторяющихся лозунгов и без ровных
+📝 Тема «{title}» объяснена человеческим языком: без повторяющихся лозунгов и без ровных
 абзацев, написанных под копирку.
 {points}
 
-Открой файл, найди свою ситуацию и двигайся по шагам. Если игра предлагает несколько
+👉 Открой файл, найди свою ситуацию и двигайся по шагам. Если игра предлагает несколько
 вариантов выбора, в тексте указано, чем они отличаются и когда какой вариант выгоднее.
 {sampled_emojis[1]} Вопросы по содержанию можно задать продавцу после покупки.
 """
 
     return random.choice([v1, v2, v3, v4, v5, v6]).strip()
 
+
+# ─── Английские поля лота без запросов к ИИ ────────────────────────────
+# FunPay требует заполнять [en]-поля, но их перевод на каждый лот стоил
+# 3 лишних запроса и часто обрывался. Английский текст собирается локально:
+# это мгновенно и не зависит от Worker'а.
+
+def generate_short_description_en():
+    """Короткое английское описание в пределах 70 символов / 120 байт."""
+    return random.choice([
+        "Game guide + instant auto delivery 24/7",
+        "Detailed game guide with auto delivery 24/7",
+        "Gaming guide, instant automatic delivery",
+        "Game guide and tips, delivered instantly",
+    ])
+
+
+def generate_full_description_en():
+    """Английское подробное описание: больше 500 ASCII-символов, без ИИ."""
+    return (
+        "Instant auto delivery 24/7\n"
+        "The link appears right after payment - you do not need to wait for the seller.\n\n"
+        "Inside you will find a detailed guide with a clear plan: what to prepare, "
+        "where to go and which settings to change first. The material is split into "
+        "short blocks, so it is easy to follow even if you open it for the first time.\n\n"
+        "What is included:\n"
+        "- step by step instructions for the main route or setup;\n"
+        "- exact values, timings and conditions that change the result;\n"
+        "- alternative options if the main method does not fit your character, "
+        "mode or equipment;\n"
+        "- common mistakes that waste time and resources.\n\n"
+        "Before you start, check the current game version and your difficulty mode. "
+        "Small details often change the whole route, so the guide marks them next to "
+        "the advice instead of hiding them at the end.\n\n"
+        "Save the file after purchase: it is convenient to return to it before a new "
+        "session. If something in the game looks different after an update, contact the "
+        "seller and we will sort it out.\n\n"
+        "Support answers questions about the content and helps with access to the file. "
+        "Delivery works 24/7, including nights and weekends."
+    )
+
+
+def generate_payment_message_en(link=""):
+    """Английское сообщение покупателю (минимум 300 символов для FunPay).
+
+    Ссылка необязательна: если её не передали, строка про товар всё равно
+    остаётся, иначе сообщение выглядело бы оборванным.
+    """
+    first_line = "Hi! Thanks for your purchase."
+    if link:
+        first_line = f"Hi! Thanks for your purchase. Your product is here: {link}"
+    return (
+        f"{first_line}\n\n"
+        "The file is available right away, 24/7. Save this message: the link stays "
+        "active and you can open it again at any time. Inside you will find the full "
+        "guide with step by step instructions, exact values and alternative options.\n\n"
+        "If you have any question about the content or the file does not open, just "
+        "write to me here - I will help and send the material again.\n\n"
+        "Please leave a review after checking the guide. It helps other players and "
+        "keeps the support fast. Enjoy the game!"
+    )
+
 def generate_short_description_wemod(game_name):
-    c = random.sample(COLOR_BANK, 2)
-    return f"{c[0]}{c[1]}{c[0]}【МОД МЕНЮ НА {game_name.upper()}】ЧИТАЙТЕ ОПИСАНИЕ{c[0]}{c[1]}{c[0]}"
+    """Мод-меню оформляется своим стилем, чтобы не путаться с обычными гайдами."""
+    title = f"МОД МЕНЮ НА {str(game_name).upper()}"
+    return _decorate_title(title, category_style("mod"))
 
 
 def generate_full_description_wemod(game_name):

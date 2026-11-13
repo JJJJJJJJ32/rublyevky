@@ -6,6 +6,8 @@ import os
 import time
 from concurrent.futures import ThreadPoolExecutor
 
+import pytest
+
 # Мокаем g4f до импорта модулей бота
 class _MockG4f:
     class ChatCompletion:
@@ -30,6 +32,17 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 from modules.lot_publisher import enforce_limits, truncate_to_bytes
 from modules.ai_generator import _is_refused, _count_words, _is_guide_good, MIN_WORDS, MIN_CHARS
 import main as bot_main
+
+
+@pytest.fixture(autouse=True)
+def _isolate_data_files(tmp_path, monkeypatch):
+    """Журналы лотов и идей не должны протекать между тестами."""
+    monkeypatch.setattr(
+        bot_main.lot_registry, "LOTS_FILE", str(tmp_path / "published_lots.json")
+    )
+    monkeypatch.setattr(
+        bot_main.idea_cache, "IDEAS_FILE", str(tmp_path / "game_ideas.json")
+    )
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -268,6 +281,74 @@ class TestFunPayErrors:
 
 
 # ═══════════════════════════════════════════════════════════════════════
+# 5b. publish_lot собирает все поля без исключений (регрессия v19.15)
+# ═══════════════════════════════════════════════════════════════════════
+
+class _FakeResponse:
+    def __init__(self, text="", status_code=200, payload=None):
+        self.text = text
+        self.status_code = status_code
+        self._payload = payload or {}
+
+    def json(self):
+        return self._payload
+
+
+class _FakeSession:
+    """Отдаёт форму лота и принимает сохранение как настоящий FunPay."""
+
+    FORM = (
+        "<html><body data-app-data='{\"csrf-token\": \"tok\"}'>"
+        "<input type='hidden' name='hidden_field' value='1'>"
+        "<input name='fields[summary][ru]' value=''>"
+        "<input name='fields[summary][en]' value=''>"
+        "<input name='fields[desc][ru]' value=''>"
+        "<input name='fields[desc][en]' value=''>"
+        "<input name='fields[payment_msg][ru]' value=''>"
+        "<input name='fields[payment_msg][en]' value=''>"
+        "</body></html>"
+    )
+
+    def __init__(self):
+        self.payload = None
+
+    def get(self, url, **kwargs):
+        return _FakeResponse(self.FORM)
+
+    def post(self, url, **kwargs):
+        self.payload = kwargs.get("data") or {}
+        return _FakeResponse(payload={"done": True})
+
+
+def test_publish_lot_fills_english_payment_message_with_link():
+    """Английское сообщение раньше падало без ссылки и лот не публиковался."""
+    from modules.lot_publisher import publish_lot
+    from modules.description_builder import (
+        generate_full_description_ruble,
+        generate_short_description_ruble,
+        generate_payment_message,
+    )
+
+    link = "https://drive.google.com/file/d/test/view"
+    session = _FakeSession()
+    game = {"game_id": 42}
+    idea = {"title": "ФАРМ РЕСУРСОВ", "content_points": ["Первый шаг"]}
+
+    result = publish_lot(
+        session,
+        game,
+        generate_short_description_ruble(idea["title"]),
+        generate_full_description_ruble(idea, "Тестовая игра"),
+        generate_payment_message(link),
+        1,
+    )
+
+    assert result == "success"
+    assert link in session.payload["fields[payment_msg][en]"]
+
+
+
+# ═══════════════════════════════════════════════════════════════════════
 # 6. Config limits — проверка что лимиты адекватные
 # ═══════════════════════════════════════════════════════════════════════
 
@@ -490,3 +571,200 @@ class TestGuideHeartbeat:
             bot_main._await_content(future)
 
         assert capsys.readouterr().out.count("Гайд ещё считается") >= 2
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# 11. Сбой поиска раздела и сбой ИИ не должны стирать список игр
+# ═══════════════════════════════════════════════════════════════════════
+
+def _run_game_with_error(monkeypatch, capsys, error):
+    """Прогоняет игру, где поиск раздела падает с заданной ошибкой."""
+    removed = []
+    marked = []
+
+    monkeypatch.setattr(bot_main, "_generate_ideas_timed", lambda name: ([], 0.01))
+    monkeypatch.setattr(
+        bot_main,
+        "find_funpay_category",
+        lambda session, name: (_ for _ in ()).throw(error),
+    )
+    monkeypatch.setattr(bot_main, "remove_game_from_list", lambda name: removed.append(name))
+    monkeypatch.setattr(bot_main, "mark_as_processed", lambda game_id: marked.append(game_id))
+
+    bot_main.process_single_game(
+        session=object(),
+        game_data=_FakeGameData({"game_name": "Some Game"}),
+        net_session=object(),
+    )
+    return removed, marked, capsys.readouterr().out
+
+
+class TestLookupFailureKeepsGamesList:
+
+    def test_network_error_keeps_game(self, monkeypatch, capsys):
+        removed, marked, output = _run_game_with_error(
+            monkeypatch, capsys, bot_main.CategoryLookupError("сетевая ошибка")
+        )
+
+        assert removed == [], "сетевой сбой не должен удалять игру из списка"
+        assert marked == []
+        assert "Не удалось проверить игру на FunPay" in output
+        assert "остаётся в списке" in output
+
+    def test_ai_error_keeps_game(self, monkeypatch, capsys):
+        """Недоступный Worker отпускает игру в главный цикл, но не удаляет её."""
+        removed = []
+        monkeypatch.setattr(bot_main, "_generate_ideas_timed", lambda name: ([], 0.01))
+        monkeypatch.setattr(
+            bot_main,
+            "find_funpay_category",
+            lambda session, name: (_ for _ in ()).throw(
+                bot_main.ai_client.AIUnavailable("Worker недоступен")
+            ),
+        )
+        monkeypatch.setattr(bot_main, "remove_game_from_list", lambda name: removed.append(name))
+        monkeypatch.setattr(bot_main, "mark_as_processed", lambda game_id: removed.append(game_id))
+
+        with pytest.raises(bot_main.ai_client.AIUnavailable):
+            bot_main.process_single_game(
+                session=object(),
+                game_data=_FakeGameData({"game_name": "Some Game"}),
+                net_session=object(),
+            )
+
+        assert removed == [], "сбой ИИ не должен удалять игру из списка"
+        output = capsys.readouterr().out
+        assert "ИИ недоступен" in output
+        assert "остаётся в списке" in output
+
+    def test_plain_ai_error_keeps_game(self, monkeypatch, capsys):
+        """Обычная ошибка ИИ не роняет обработку и не удаляет игру."""
+        removed, marked, output = _run_game_with_error(
+            monkeypatch, capsys, bot_main.ai_client.AIError("пустой ответ")
+        )
+
+        assert removed == [], "ошибка ИИ не должна удалять игру из списка"
+        assert marked == []
+        assert "ИИ не ответил" in output
+        assert "остаётся в списке" in output
+
+    def test_unexpected_error_keeps_game(self, monkeypatch, capsys):
+        removed, marked, output = _run_game_with_error(
+            monkeypatch, capsys, RuntimeError("неожиданный сбой")
+        )
+
+        assert removed == [], "неожиданный сбой не должен удалять игру из списка"
+        assert marked == []
+        assert "Ошибка в игре" in output
+        assert "остаётся в списке" in output
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# 10. Повтор игры не создаёт дубли лотов
+# ═══════════════════════════════════════════════════════════════════════
+
+def _run_game_with_lots(monkeypatch, capsys, ideas):
+    """Прогоняет игру с готовыми идеями. Возвращает (опубликованные, marked, вывод)."""
+    published = []
+    marked = []
+
+    monkeypatch.setattr(bot_main, "_generate_ideas_timed", lambda name: ([], 0.01))
+    monkeypatch.setattr(bot_main, "_generate_content_timed", lambda idea, game: ("Подробный гайд по игре", 0.01))
+    monkeypatch.setattr(
+        bot_main,
+        "find_funpay_category",
+        lambda session, name: {"id": 42, "type": "games", "game_id": 42},
+    )
+    monkeypatch.setattr(bot_main, "get_category_info", lambda session, game_id: "Games")
+    monkeypatch.setattr(bot_main, "is_game_processed", lambda game_id: False)
+    monkeypatch.setattr(bot_main, "build_final_ideas", lambda *a, **k: list(ideas))
+    monkeypatch.setattr(bot_main.gdrive, "create_folder", lambda name: "folder-id")
+    monkeypatch.setattr(bot_main.gdrive, "upload_file", lambda path, folder: "https://drive.example/file")
+    monkeypatch.setattr(bot_main, "remove_game_from_list", lambda name: None)
+    monkeypatch.setattr(bot_main, "mark_as_processed", lambda game_id: marked.append(game_id))
+    monkeypatch.setattr(bot_main, "check_wemod_availability", lambda name: False)
+    # В тестах модуль slugify подменён экземпляром класса: его метод
+    # привязывается к self. Явная функция убирает эту особенность.
+    monkeypatch.setattr(
+        bot_main, "slugify", lambda text, **kwargs: text.lower().replace(" ", "-")[:50]
+    )
+
+    def _publish(session, net_session, game_id, short, full, pay_msg, price, **kwargs):
+        published.append(short)
+        return "success", session, net_session
+
+    monkeypatch.setattr(bot_main, "_publish_with_heal", _publish)
+    monkeypatch.setattr(bot_main.time, "sleep", lambda seconds: None)
+
+    bot_main.process_single_game(
+        session=object(),
+        game_data=_FakeGameData({"game_name": "Some Game"}),
+        net_session=object(),
+    )
+    return published, marked, capsys.readouterr().out
+
+
+class TestPublishedLotsAreNotRepeated:
+
+    def test_second_run_skips_already_published_lot(self, monkeypatch, capsys):
+        ideas = [
+            {"id": "pc_optimization", "title": "МАНУАЛ ПО ОПТИМИЗАЦИИ ПК", "type": "мануал"},
+            {"title": "10 СПОСОБОВ ФАРМА", "type": "гайд"},
+        ]
+        bot_main.lot_registry.mark_published(42, "МАНУАЛ ПО ОПТИМИЗАЦИИ ПК")
+
+        published, marked, output = _run_game_with_lots(monkeypatch, capsys, ideas)
+
+        assert len(published) == 1, "уже выставленный лот нельзя публиковать снова"
+        assert "уже выставлен — пропуск" in output
+        assert marked == [42]
+
+    def test_mandatory_lot_is_recognised_by_id_even_if_title_changed(self, monkeypatch, capsys):
+        """ИИ переформулировал название — id обязательного товара остаётся тем же."""
+        bot_main.lot_registry.mark_published(42, "mandatory:pc_optimization")
+        ideas = [
+            {"id": "pc_optimization", "title": "СОВСЕМ ДРУГОЕ НАЗВАНИЕ", "type": "мануал"},
+        ]
+
+        published, marked, output = _run_game_with_lots(monkeypatch, capsys, ideas)
+
+        assert published == []
+        assert "Все лоты этой игры уже выставлены ранее" in output
+        assert marked == [42]
+
+    def test_successful_publication_is_remembered(self, monkeypatch, capsys):
+        ideas = [{"id": "ping", "title": "НАСТРОЙКИ СТАБИЛЬНОЙ ИГРЫ", "type": "инструкция"}]
+
+        _run_game_with_lots(monkeypatch, capsys, ideas)
+
+        assert bot_main.lot_registry.was_published(42, "НАСТРОЙКИ СТАБИЛЬНОЙ ИГРЫ")
+        assert bot_main.lot_registry.was_published(42, "mandatory:ping")
+
+    def test_cached_ideas_are_reused_without_new_request(self, monkeypatch, capsys):
+        """После сбоя игра берёт те же идеи — иначе названия не совпадут."""
+        saved = [{"title": "СОХРАНЁННАЯ ИДЕЯ", "type": "гайд"}]
+        bot_main.idea_cache.save_ideas(42, saved)
+        calls = []
+
+        monkeypatch.setattr(
+            bot_main, "_generate_ideas_timed", lambda name: calls.append(name) or ([], 0.01)
+        )
+        monkeypatch.setattr(bot_main, "build_final_ideas", lambda *a, **k: list(saved))
+        monkeypatch.setattr(
+            bot_main,
+            "find_funpay_category",
+            lambda session, name: {"id": 42, "type": "games", "game_id": 42},
+        )
+        monkeypatch.setattr(bot_main, "get_category_info", lambda session, game_id: "Games")
+        monkeypatch.setattr(bot_main, "is_game_processed", lambda game_id: False)
+        monkeypatch.setattr(bot_main, "check_wemod_availability", lambda name: False)
+        monkeypatch.setattr(bot_main, "remove_game_from_list", lambda name: None)
+        monkeypatch.setattr(bot_main, "mark_as_processed", lambda game_id: None)
+
+        bot_main.process_single_game(
+            session=object(),
+            game_data=_FakeGameData({"game_name": "Some Game"}),
+            net_session=object(),
+        )
+
+        assert calls == [], "сохранённые идеи не должны запрашиваться у ИИ заново"
