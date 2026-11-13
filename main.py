@@ -694,7 +694,7 @@ def _preflight_ai():
 
 
 def main():
-    print("=== FUNPAY AUTO-BOT v19.20 (без Запрета, ИИ через Cloudflare Worker) ===\n")
+    print("=== FUNPAY AUTO-BOT v19.21 (без Запрета, ИИ через Cloudflare Worker) ===\n")
 
     net_session, net_ok = setup_network()
     if not net_ok:

@@ -65,6 +65,24 @@ CLOUDFLARE_FALLBACKS = [
     "@cf/openai/gpt-oss-20b",
 ]
 
+# Самый последний рубеж — бесплатные модели без ключей и без Worker'а.
+# Стоят после Gemini и Cloudflare: включаются, когда дневные квоты
+# закончились, чтобы бот не вставал до полуночи. Список переопределяется
+# в .env (AI_FREE_MODELS через запятую, "off" — отключить).
+FREE_FALLBACKS = [
+    "llm7/gpt-oss:20b",
+    "llm7/codestral-latest",
+    "llm7/GLM-5.3-Flash",
+    "llm7/DeepSeek-V4-Flash-0731",
+    "pollinations/openai-fast",
+]
+
+# Куда идти напрямую для этих моделей. Ключи не нужны, Worker не участвует.
+PUBLIC_PROVIDERS = {
+    "llm7": "https://api.llm7.io/v1/chat/completions",
+    "pollinations": "https://text.pollinations.ai/openai",
+}
+
 REQUEST_TIMEOUT = int(os.getenv("AI_TIMEOUT", "90"))   # секунды на один запрос
 # Даже если в .env стоит 180, один запрос дольше 90 секунд — это почти всегда
 # зависшее соединение: ответы Gemini с отключёнными рассуждениями приходят
@@ -319,13 +337,38 @@ def get_cloudflare_models():
     return [model.strip() for model in raw.split(",") if model.strip()]
 
 
+def get_free_models():
+    """Бесплатные модели без ключей: llm7 и Pollinations (можно отключить)."""
+    raw = os.getenv("AI_FREE_MODELS")
+    if raw is None:
+        return list(FREE_FALLBACKS)
+    raw = raw.strip()
+    if raw.lower() in ("", "0", "off", "no", "none"):
+        return []
+    return [model.strip() for model in raw.split(",") if model.strip()]
+
+
+def _public_target(model_name):
+    """Разбирает «провайдер/модель» для бесплатных моделей без ключа."""
+    provider, _, remote = str(model_name or "").partition("/")
+    if provider in PUBLIC_PROVIDERS and remote:
+        return provider, remote
+    return None, None
+
+
+def is_free_model(model_name):
+    """True, если модель обслуживается бесплатным провайдером без ключа."""
+    provider, _ = _public_target(model_name)
+    return provider is not None
+
+
 def get_model_chain():
     """
-    Основные модели + резерв Gemini + бесплатные модели Cloudflare.
+    Основные модели + резерв Gemini + Cloudflare + бесплатные без ключей.
 
     У каждой модели Gemini свой дневной лимит, у Cloudflare — отдельный
     лимит нейронов. Поэтому 429 у одной модели больше не останавливает бота:
-    он идёт по цепочке дальше и в конце пробует Cloudflare.
+    он идёт по цепочке дальше и в конце пробует llm7 и Pollinations.
     """
     chain = list(get_model_priority())
     if not any(model.startswith("gemini-") for model in chain):
@@ -334,6 +377,9 @@ def get_model_chain():
         if reserve not in chain:
             chain.append(reserve)
     for model in get_cloudflare_models():
+        if model not in chain:
+            chain.append(model)
+    for model in get_free_models():
         if model not in chain:
             chain.append(model)
     return chain
@@ -515,6 +561,79 @@ class AIClient:
         )
         return text
 
+    # ─── Бесплатные модели без ключей (llm7, Pollinations) ──────────────
+
+    def _public_chat(self, model_name, provider, remote, messages, max_tokens=None, temperature=None):
+        """Запрос к бесплатному провайдеру без ключа и без Worker'а.
+
+        Это последний рубеж: дневные квоты Gemini и Cloudflare исчерпаны,
+        но бот не встаёт до полуночи, а продолжает публиковать лоты.
+        """
+        payload = {"model": remote, "messages": messages, "stream": False}
+        if max_tokens:
+            payload["max_tokens"] = max_tokens
+        if temperature is not None:
+            payload["temperature"] = temperature
+
+        started = time.time()
+        try:
+            resp = self.session.post(
+                PUBLIC_PROVIDERS[provider],
+                headers={"Content-Type": "application/json"},
+                json=payload,
+                timeout=self.timeout,
+            )
+        except requests.exceptions.ReadTimeout as e:
+            self._start_cooldown(model_name, str(e), transient=True)
+            raise AIModelUnavailable(
+                f"{model_name}: не ответила за {int(self.timeout)} с"
+            ) from e
+        except requests.exceptions.RequestException as e:
+            self._start_cooldown(model_name, str(e), transient=True)
+            raise AIModelUnavailable(
+                f"{model_name}: {_short_network_error(e)}"
+            ) from e
+
+        elapsed = round(time.time() - started, 1)
+        error_text = _extract_error(resp)
+        status = resp.status_code
+
+        if status == 402:
+            # Pollinations: «Free limit reached: 1 reply every 45 seconds».
+            seconds = _retry_after(error_text) or 60
+            self._start_cooldown(model_name, error_text, transient=True, seconds=seconds)
+            raise AIModelUnavailable(
+                f"{model_name}: бесплатный лимит, пауза {seconds} с — {error_text}"
+            )
+        if status == 429:
+            self._start_cooldown(model_name, error_text, transient=True)
+            raise AIModelUnavailable(
+                f"{model_name}: лимит провайдера — {error_text}"
+            )
+        if status in (401, 403):
+            self._mark_unsupported(model_name, error_text)
+            raise AIModelNotSupported(f"{model_name}: {error_text}")
+        if status >= 500:
+            self._start_cooldown(model_name, error_text, transient=True)
+            raise AIModelUnavailable(
+                f"{model_name}: сервис перегружен ({status}) — {error_text}"
+            )
+        if status != 200:
+            raise AIError(f"{model_name}: статус {status} — {error_text}")
+
+        try:
+            data = resp.json()
+        except ValueError:
+            raise AIError(f"{model_name}: провайдер вернул не JSON")
+
+        text = _extract_text(data)
+        if not text:
+            raise AIError(f"{model_name}: пустой ответ")
+
+        _log_usage(model_name, data.get("usage"), elapsed, len(text))
+        logger.info(f"[AI] {model_name} ответила за {elapsed} с ({len(text)} симв.)")
+        return text
+
     # ─── Проверка связи ────────────────────────────────────────────────
 
     def health(self):
@@ -630,10 +749,11 @@ class AIClient:
         Один запрос к указанной модели (или к первой доступной из списка).
         Возвращает текст ответа. Бросает AIError-наследников при проблемах.
         """
-        if not self.configured and not direct_available():
+        if not self.configured and not direct_available() and not get_free_models():
             raise AIUnavailable(
                 "AI_WORKER_URL не задан — Worker не настроен, "
-                "и GEMINI_API_KEY для прямого пути тоже нет"
+                "GEMINI_API_KEY для прямого пути нет, "
+                "бесплатные модели AI_FREE_MODELS отключены"
             )
 
         models = [model] if model else list(self.models)
@@ -659,6 +779,20 @@ class AIClient:
                         f"{model_name}: лимит исчерпан, {note}"
                     )
                 continue
+            provider, remote = _public_target(model_name)
+            if provider:
+                # Бесплатная модель без ключа: идём к провайдеру напрямую,
+                # Worker и токен ей не нужны.
+                try:
+                    return self._public_chat(
+                        model_name, provider, remote, messages, max_tokens, temperature
+                    )
+                except AILimitReached:
+                    raise
+                except AIError as e:
+                    last_error = e
+                    logger.info(f"[AI] {model_name} не справилась: {e}")
+                    continue
             for attempt in range(1, attempts + 1):
                 if not self.configured:
                     # Worker'а нет вовсе — сразу идём в Gemini API.
@@ -924,9 +1058,18 @@ class AIClient:
                 last_error = e
                 logger.info(f"[AI] {model_name} временно недоступна: {e}")
                 continue
-            except AIUnavailable:
-                # Адрес Worker'а один для всех моделей: если он совсем
-                # недоступен, повторять тот же запрос к нему бессмысленно.
+            except AIUnavailable as e:
+                # Общая проблема: нет ключа Gemini, Worker отклонил токен или
+                # поток оборвался. Бесплатным моделям без ключей Worker не
+                # нужен, поэтому если они ещё впереди — идём к ним, а не
+                # останавливаем игру.
+                last_error = e
+                rest = chain[index + 1:]
+                if any(is_free_model(name) for name in rest):
+                    logger.info(
+                        f"[AI] {model_name}: {e}. Пробуем бесплатные модели без ключей"
+                    )
+                    continue
                 raise
             except AIError as e:
                 last_error = e
@@ -1064,6 +1207,14 @@ def _gemini_usage(data):
     }
 
 
+def _retry_after(error_text):
+    """Сколько секунд просит подождать провайдер («Retry after 41s»)."""
+    match = re.search(
+        r"retry\s+after\s+(\d+)\s*s", str(error_text or ""), re.IGNORECASE
+    )
+    return int(match.group(1)) if match else 0
+
+
 def _repair_mojibake(text):
     """Чинит текст, который Worker отдал в UTF-8 поверх cp1251.
 
@@ -1178,9 +1329,10 @@ def ai_ask(messages, models=None, max_tokens=None, temperature=None):
     ни Gemini SDK, ни g4f в боте не используются.
     Возвращает текст ответа.
     """
-    if not client.configured and not direct_available():
+    if not client.configured and not direct_available() and not get_free_models():
         raise AIUnavailable(
-            "ИИ не настроен: в .env нет AI_WORKER_URL и нет GEMINI_API_KEY. "
+            "ИИ не настроен: в .env нет AI_WORKER_URL, нет GEMINI_API_KEY "
+            "и отключены бесплатные модели AI_FREE_MODELS. "
             "Поднимите Cloudflare Worker (см. README.md, раздел 4) "
             "и впишите его адрес в .env — или добавьте ключ Gemini для прямого пути."
         )

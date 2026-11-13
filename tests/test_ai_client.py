@@ -380,12 +380,16 @@ class TestGeminiOnly:
         assert server.requested_models == ["gemini-3.6-flash"]
 
     def test_missing_worker_does_not_fall_back_to_g4f(self, monkeypatch):
+        """Без Worker, без ключа Gemini и с выключенными free-моделями — ошибка."""
+        monkeypatch.setenv("AI_FREE_MODELS", "off")
+        monkeypatch.delenv("GEMINI_API_KEY", raising=False)
         monkeypatch.setattr(
             ai_client, "client", ai_client.AIClient(base_url="", token="")
         )
         with pytest.raises(ai_client.AIUnavailable) as error:
             ai_client.ai_ask([{"role": "user", "content": "привет"}])
         assert "AI_WORKER_URL" in str(error.value)
+        assert "AI_FREE_MODELS" in str(error.value)
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -1007,10 +1011,14 @@ class TestCloudflareFallbacks:
     def test_default_chain_ends_with_cloudflare(self, monkeypatch):
         monkeypatch.delenv("AI_MODEL_PRIORITY", raising=False)
         monkeypatch.delenv("AI_CLOUDFLARE_MODELS", raising=False)
+        monkeypatch.delenv("AI_FREE_MODELS", raising=False)
 
         chain = ai_client.get_model_chain()
 
-        assert chain[-len(ai_client.CLOUDFLARE_FALLBACKS):] == ai_client.CLOUDFLARE_FALLBACKS
+        free = ai_client.FREE_FALLBACKS
+        assert chain[-len(free):] == free
+        cloudflare = chain[-len(free) - len(ai_client.CLOUDFLARE_FALLBACKS):-len(free)]
+        assert cloudflare == ai_client.CLOUDFLARE_FALLBACKS
         assert "@cf/openai/gpt-oss-120b" in chain
 
     def test_cloudflare_models_can_be_disabled(self, monkeypatch):
@@ -1021,6 +1029,7 @@ class TestCloudflareFallbacks:
 
     def test_cloudflare_models_from_env(self, monkeypatch):
         monkeypatch.setenv("AI_CLOUDFLARE_MODELS", "@cf/openai/gpt-oss-20b, @cf/qwen/qwen3-30b-a3b-fp8")
+        monkeypatch.setenv("AI_FREE_MODELS", "off")
 
         extra = ai_client.get_cloudflare_models()
 
@@ -1271,3 +1280,169 @@ class TestRecurringErrors:
                 return ""
 
         assert ai_client._extract_error(_Response()) == "неверный токен Worker'а"
+
+
+class TestFreeModels:
+    """Бесплатные модели без ключей: работают, когда кончились все квоты."""
+
+    def test_default_chain_ends_with_free_models(self, monkeypatch):
+        monkeypatch.delenv("AI_MODEL_PRIORITY", raising=False)
+        monkeypatch.delenv("AI_FREE_MODELS", raising=False)
+
+        chain = ai_client.get_model_chain()
+
+        assert chain[-len(ai_client.FREE_FALLBACKS):] == ai_client.FREE_FALLBACKS
+
+    def test_free_models_can_be_disabled(self, monkeypatch):
+        monkeypatch.setenv("AI_FREE_MODELS", "off")
+
+        assert ai_client.get_free_models() == []
+        assert not any(
+            ai_client.is_free_model(model) for model in ai_client.get_model_chain()
+        )
+
+    def test_free_models_from_env(self, monkeypatch):
+        monkeypatch.setenv("AI_FREE_MODELS", "llm7/gpt-oss:20b, pollinations/openai-fast")
+
+        assert ai_client.get_free_models() == [
+            "llm7/gpt-oss:20b",
+            "pollinations/openai-fast",
+        ]
+
+    def test_llm7_goes_direct_without_token(self):
+        calls = []
+
+        class _Session:
+            def post(self, url, **kwargs):
+                calls.append((url, kwargs))
+                return _FakeResponse(
+                    data={"choices": [{"message": {"content": "ответ llm7"}}]}
+                )
+
+        client = ai_client.AIClient(
+            base_url="http://worker.test",
+            token="секрет",
+            session=_Session(),
+            timeout=5,
+            models=["llm7/gpt-oss:20b"],
+        )
+
+        text = client.chat(
+            [{"role": "user", "content": "тест"}], model="llm7/gpt-oss:20b"
+        )
+
+        assert text == "ответ llm7"
+        url, kwargs = calls[0]
+        assert url == "https://api.llm7.io/v1/chat/completions"
+        assert "Authorization" not in kwargs["headers"]
+        assert kwargs["json"]["model"] == "gpt-oss:20b"
+
+    def test_free_model_works_without_worker(self):
+        class _Session:
+            def post(self, url, **kwargs):
+                return _FakeResponse(
+                    data={"choices": [{"message": {"content": "без Worker'а"}}]}
+                )
+
+        client = ai_client.AIClient(
+            base_url="",
+            token="",
+            session=_Session(),
+            timeout=5,
+            models=["pollinations/openai-fast"],
+        )
+
+        text = client.chat(
+            [{"role": "user", "content": "тест"}], model="pollinations/openai-fast"
+        )
+
+        assert text == "без Worker'а"
+
+    def test_worker_rejected_token_falls_back_to_free_model(self):
+        """Worker сломан — игра продолжается на бесплатной модели без ключа."""
+        calls = []
+
+        class _Session:
+            def post(self, url, **kwargs):
+                calls.append(url)
+                if "worker.test" in url:
+                    return _FakeResponse(
+                        status_code=401,
+                        data={"error": {"message": "неверный токен Worker'а"}},
+                    )
+                return _FakeResponse(
+                    data={"choices": [{"message": {"content": "ответ без Worker'а"}}]}
+                )
+
+        client = ai_client.AIClient(
+            base_url="http://worker.test",
+            token="плохой",
+            session=_Session(),
+            timeout=5,
+            models=["gemini-3.6-flash", "llm7/gpt-oss:20b"],
+        )
+
+        text, model = client.chat_chain([{"role": "user", "content": "тест"}])
+
+        assert text == "ответ без Worker'а"
+        assert model == "llm7/gpt-oss:20b"
+        assert any("llm7" in url for url in calls)
+
+    def test_pollinations_free_limit_switches_to_next_model(self):
+        """402 «1 reply every 45 seconds» — короткая пауза, не остановка игры."""
+        calls = []
+
+        class _Session:
+            def post(self, url, **kwargs):
+                calls.append(url)
+                if "pollinations" in url:
+                    return _FakeResponse(
+                        status_code=402,
+                        data={"error": {
+                            "message": "Free limit reached: 1 reply every 45 seconds per IP. Retry after 41s",
+                        }},
+                    )
+                return _FakeResponse(
+                    data={"choices": [{"message": {"content": "ответ llm7"}}]}
+                )
+
+        client = ai_client.AIClient(
+            base_url="http://worker.test",
+            token="t",
+            session=_Session(),
+            timeout=5,
+            models=["pollinations/openai-fast", "llm7/gpt-oss:20b"],
+        )
+
+        text, model = client.chat_chain([{"role": "user", "content": "тест"}])
+
+        assert text == "ответ llm7"
+        assert model == "llm7/gpt-oss:20b"
+        assert 0 < client._cooldown_left("pollinations/openai-fast") <= 42
+        assert client._cooldown_kind["pollinations/openai-fast"] == "transient"
+
+    def test_llm7_rate_limit_switches_to_next_model(self):
+        class _Session:
+            def post(self, url, **kwargs):
+                if "llm7" in url and kwargs["json"]["model"] == "codestral-latest":
+                    return _FakeResponse(
+                        status_code=429,
+                        data={"error": {"message": "too many requests"}},
+                    )
+                return _FakeResponse(
+                    data={"choices": [{"message": {"content": "ответ второй модели"}}]}
+                )
+
+        client = ai_client.AIClient(
+            base_url="http://worker.test",
+            token="t",
+            session=_Session(),
+            timeout=5,
+            models=["llm7/codestral-latest", "llm7/gpt-oss:20b"],
+        )
+
+        text, model = client.chat_chain([{"role": "user", "content": "тест"}])
+
+        assert text == "ответ второй модели"
+        assert model == "llm7/gpt-oss:20b"
+        assert client._cooldown_left("llm7/codestral-latest") > 0
